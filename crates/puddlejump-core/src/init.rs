@@ -9,6 +9,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::config::CONFIG_FILE_NAME;
+use crate::execute::Verdict;
 use crate::host::{HostName, HOSTS_DIR_NAME};
 use crate::link::{FileSystemState, FileSystemStateError, PathState};
 use crate::package::PACKAGES_DIR_NAME;
@@ -220,6 +221,22 @@ pub struct InitOutcome {
     pub step: InitStep,
     /// What happened.
     pub result: InitResult,
+}
+
+/// Whether initializing succeeded or something in it failed.
+///
+/// Planning problems that stop a run, such as conflicts, are
+/// [`InitError`]s, not outcomes, so a list of outcomes is judged only on
+/// whether a step failed.
+pub fn init_verdict(outcomes: &[InitOutcome]) -> Verdict {
+    let failed = outcomes
+        .iter()
+        .any(|outcome| matches!(outcome.result, InitResult::Failed { .. }));
+    if failed {
+        Verdict::Failed
+    } else {
+        Verdict::Success
+    }
 }
 
 /// Creates what `plan` says.
@@ -728,6 +745,35 @@ mod tests {
         assert!(matches!(profile.result, InitResult::Failed { .. }));
         assert!(root.join("puddlejump.toml").is_file());
         assert!(root.join("packages").is_dir());
+    }
+
+    fn outcome_with(result: InitResult) -> InitOutcome {
+        InitOutcome {
+            step: InitStep::CreateDirectory {
+                path: PathBuf::from("/x"),
+            },
+            result,
+        }
+    }
+
+    #[test]
+    fn the_verdict_is_failed_only_if_a_step_failed() {
+        let failed = InitResult::Failed {
+            reason: "no".to_string(),
+        };
+
+        assert_eq!(init_verdict(&[]), Verdict::Success);
+        assert_eq!(
+            init_verdict(&[
+                outcome_with(InitResult::Created),
+                outcome_with(InitResult::Skipped)
+            ]),
+            Verdict::Success
+        );
+        assert_eq!(
+            init_verdict(&[outcome_with(InitResult::Created), outcome_with(failed)]),
+            Verdict::Failed
+        );
     }
 
     #[test]
