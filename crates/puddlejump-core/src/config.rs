@@ -48,6 +48,11 @@ pub enum ConfigError {
     },
 }
 
+/// Every key `puddlejump.toml` accepts. Keep this in step with `RawConfig`
+/// below, and document each key in the starter config that `init` writes; a
+/// test fails until the starter mentions every key listed here.
+pub const CONFIG_KEYS: [&str; 1] = ["package_manager"];
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {

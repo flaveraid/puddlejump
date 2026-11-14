@@ -14,16 +14,27 @@ use crate::host::{HostName, HOSTS_DIR_NAME};
 use crate::link::{FileSystemState, FileSystemStateError, PathState};
 use crate::package::PACKAGES_DIR_NAME;
 
-/// The starter `puddlejump.toml`. Everything is commented out, so the repo
-/// behaves as if there were no config until the user opts in.
+/// The starter `puddlejump.toml`, with every key it accepts. The key is
+/// commented out, so the repo behaves as if there were no config until the user
+/// opts in; setting it would make a machine without that manager an error.
 pub const STARTER_CONFIG: &str = "\
-# Uncomment to skip package manager auto-detection. Only \"xbps\" is supported.
+# puddlejump repo config. Every key is optional.
+
+# The package manager to use instead of detecting one from PATH.
+# Only \"xbps\" (Void Linux) is supported. If set, it must be installed.
 # package_manager = \"xbps\"
 ";
 
-/// The starter host profile: a machine that wants nothing yet.
+/// The starter host profile, with every key it accepts. A machine that wants
+/// nothing yet.
 pub const STARTER_HOST_PROFILE: &str = "\
-# Packages this machine wants. Their dependencies are added automatically.
+# Packages this machine wants, by name. Every key is optional.
+#
+# List only the packages you want linked; the packages they depend on (see
+# `depends` in a package's manifest.toml) are added automatically.
+#
+# With no packages listed here, `puddlejump link` links nothing for this host.
+# packages = [\"zsh\", \"nvim\"]
 packages = []
 ";
 
@@ -111,8 +122,9 @@ pub enum InitError {
 /// `hosts/` and `packages/`, and a profile named for `hostname`.
 ///
 /// A path that already exists is left alone, so this is safe to run again, for
-/// example to add the profile for a second machine. If `hostname` is `None` or
-/// not a valid profile name, the profile is left out and a note says why.
+/// example to add the profile for a second machine. The hostname is converted
+/// to a safe filename (see [`HostName::from_hostname`]); if it is `None` or
+/// nothing usable is left, the profile is left out and a note says why.
 ///
 /// Errors if a path cannot be inspected.
 pub fn plan_init(
@@ -151,10 +163,14 @@ pub fn plan_init(
 }
 
 /// Where the profile for `hostname` goes, or why there is no profile.
+///
+/// The hostname is converted to a safe filename the same way host selection
+/// converts it, so the profile is found again by the machine it was made for.
 fn host_profile_path(root: &Path, hostname: Option<&str>) -> Result<PathBuf, String> {
     let hostname = hostname.ok_or_else(|| "the machine's hostname is unknown".to_string())?;
-    let name = HostName::new(hostname)
-        .map_err(|error| format!("the hostname cannot be a profile name: {error}"))?;
+    let name = HostName::from_hostname(hostname).ok_or_else(|| {
+        format!("the hostname {hostname:?} has nothing left to name a profile after")
+    })?;
     Ok(root.join(HOSTS_DIR_NAME).join(format!("{name}.toml")))
 }
 
@@ -316,8 +332,8 @@ fn failed(reason: impl ToString) -> InitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RepoConfig;
-    use crate::host::HostProfile;
+    use crate::config::{RepoConfig, CONFIG_KEYS};
+    use crate::host::{HostProfile, PROFILE_KEYS};
     use crate::link::RealFileSystem;
     use crate::package::Repo;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -326,6 +342,16 @@ mod tests {
         let plan = plan_init(root, hostname, &RealFileSystem).unwrap();
         let outcomes = execute_init(&plan, &RealFileSystem).unwrap();
         (plan, outcomes)
+    }
+
+    /// The names of the files under `root/hosts`, sorted.
+    fn host_profiles(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root.join("hosts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     fn results(outcomes: &[InitOutcome]) -> Vec<&InitResult> {
@@ -545,24 +571,70 @@ mod tests {
     }
 
     #[test]
-    fn a_hostname_that_cannot_be_a_profile_name_skips_only_the_host_profile() {
-        for hostname in ["", ".hidden", "a/b", "../etc", "has space"] {
+    fn a_hostname_that_is_not_a_safe_filename_is_converted_to_one() {
+        let cases = [
+            ("my laptop", "my-laptop.toml"),
+            ("a/b", "a-b.toml"),
+            ("a\tb", "a-b.toml"),
+            (".hidden", "hidden.toml"),
+            ("-flag", "flag.toml"),
+            ("../../escaped", "escaped.toml"),
+        ];
+
+        for (hostname, expected) in cases {
             let parent = tempfile::tempdir().unwrap();
             let root = parent.path().join("dotfiles");
 
             let (plan, _) = init_at(&root, Some(hostname));
 
-            assert_eq!(
-                fs::read_dir(root.join("hosts")).unwrap().count(),
-                0,
-                "{hostname:?}"
-            );
+            assert_eq!(host_profiles(&root), [expected], "{hostname:?}");
+            assert!(plan.notes.is_empty(), "{hostname:?}");
+        }
+    }
+
+    #[test]
+    fn a_hostname_with_nothing_usable_in_it_skips_only_the_host_profile_and_says_why() {
+        for hostname in ["", "   ", "...", "---", "\u{0}"] {
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("dotfiles");
+
+            let (plan, _) = init_at(&root, Some(hostname));
+
+            assert!(host_profiles(&root).is_empty(), "{hostname:?}");
+            assert!(root.join("puddlejump.toml").is_file(), "{hostname:?}");
             assert!(
                 matches!(&plan.notes[..], [InitNote::NoHostProfile { reason }]
-                    if reason.contains("cannot be a profile name")),
+                    if reason.contains("nothing left to name a profile after")),
                 "{hostname:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_converted_profile_is_found_again_by_the_hostname_it_was_made_for() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("dotfiles");
+        init_at(&root, Some("my laptop"));
+
+        let available = crate::host::available_hosts(&root).unwrap();
+        let chosen =
+            crate::host::select_host(None, None, Some("my laptop"), &available, &root).unwrap();
+
+        assert_eq!(chosen.unwrap().name.as_str(), "my-laptop");
+    }
+
+    #[test]
+    fn a_profile_for_a_hostname_with_dots_keeps_its_name_and_is_found_again() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("dotfiles");
+        init_at(&root, Some("lenovo.local"));
+
+        let available = crate::host::available_hosts(&root).unwrap();
+        let chosen =
+            crate::host::select_host(None, None, Some("lenovo.local"), &available, &root).unwrap();
+
+        assert_eq!(host_profiles(&root), ["lenovo.local.toml"]);
+        assert_eq!(chosen.unwrap().name.as_str(), "lenovo.local");
     }
 
     #[test]
@@ -584,6 +656,7 @@ mod tests {
 
         assert!(!parent.path().join("escaped.toml").exists());
         assert!(!parent.path().join("../escaped.toml").exists());
+        assert_eq!(host_profiles(&root), ["escaped.toml"]);
     }
 
     #[test]
@@ -799,5 +872,105 @@ mod tests {
         assert_eq!(HOSTS_DIR_NAME, "hosts");
         assert_eq!(PACKAGES_DIR_NAME, "packages");
         assert_eq!(CONFIG_FILE_NAME, "puddlejump.toml");
+    }
+
+    /// Uncomments every `# key = value` example line in `starter`, so the
+    /// documented keys can be fed to the real parser.
+    fn with_examples_enabled(starter: &str) -> String {
+        starter
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(rest) if rest.contains(" = ") => rest.to_string(),
+                _ => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_starter_config_documents_every_key_the_parser_accepts() {
+        // A probe: each real key must be accepted, and anything else rejected,
+        // so this list cannot drift from the parser unnoticed.
+        for key in CONFIG_KEYS {
+            let probe = format!("{key} = \"xbps\"");
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(CONFIG_FILE_NAME), probe).unwrap();
+            assert!(
+                RepoConfig::load(dir.path()).is_ok(),
+                "{key} should be a key"
+            );
+            assert!(
+                STARTER_CONFIG.contains(key),
+                "the starter config never mentions {key}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(CONFIG_FILE_NAME), "no_such_key = 1").unwrap();
+        assert!(RepoConfig::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn the_starter_host_profile_documents_every_key_the_parser_accepts() {
+        for key in PROFILE_KEYS {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir(dir.path().join("hosts")).unwrap();
+            fs::write(dir.path().join("hosts/probe.toml"), format!("{key} = []")).unwrap();
+            let name = HostName::new("probe").unwrap();
+            assert!(
+                HostProfile::load(dir.path(), &name).is_ok(),
+                "{key} should be a key"
+            );
+            assert!(
+                STARTER_HOST_PROFILE.contains(key),
+                "the starter profile never mentions {key}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("hosts")).unwrap();
+        fs::write(dir.path().join("hosts/probe.toml"), "no_such_key = 1").unwrap();
+        assert!(HostProfile::load(dir.path(), &HostName::new("probe").unwrap()).is_err());
+    }
+
+    #[test]
+    fn every_documented_example_in_the_starter_config_is_valid_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            with_examples_enabled(STARTER_CONFIG),
+        )
+        .unwrap();
+
+        let config = RepoConfig::load(dir.path()).unwrap();
+
+        assert!(
+            config.package_manager.is_some(),
+            "the example enables a manager"
+        );
+    }
+
+    #[test]
+    fn every_documented_example_in_the_starter_host_profile_is_valid_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("hosts")).unwrap();
+        // The live `packages = []` line comes after the commented example, so
+        // keep only the enabled example to check the example itself parses.
+        let enabled: String = with_examples_enabled(STARTER_HOST_PROFILE)
+            .lines()
+            .filter(|line| *line != "packages = []")
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(dir.path().join("hosts/probe.toml"), enabled).unwrap();
+
+        let profile = HostProfile::load(dir.path(), &HostName::new("probe").unwrap()).unwrap();
+
+        assert_eq!(profile.packages.len(), 2, "the example lists two packages");
+    }
+
+    #[test]
+    fn the_starters_explain_each_key_in_comments() {
+        for starter in [STARTER_CONFIG, STARTER_HOST_PROFILE] {
+            let comments = starter.lines().filter(|line| line.starts_with('#')).count();
+            assert!(comments >= 2, "a starter with no explanation: {starter:?}");
+        }
     }
 }

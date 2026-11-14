@@ -34,6 +34,36 @@ impl HostName {
         PackageName::new(name).map(Self)
     }
 
+    /// Turns a machine's hostname into a profile name, replacing anything
+    /// [`HostName::new`] would reject instead of refusing it.
+    ///
+    /// Characters that cannot be in a name (path separators, whitespace,
+    /// control characters) become `-`. Leading dots and dashes are dropped, so
+    /// the profile is never a hidden file and never looks like a command-line
+    /// flag. A name that is already valid, such as `lenovo.local`, is
+    /// unchanged. Both `init` (which names the profile) and host selection
+    /// (which finds it) use this, so they always agree.
+    ///
+    /// Returns `None` if no letter or digit is left, such as for an empty
+    /// hostname or one made only of dots, dashes, or whitespace.
+    pub fn from_hostname(hostname: &str) -> Option<Self> {
+        let replaced: String = hostname
+            .chars()
+            .map(|c| {
+                if c == '/' || c.is_whitespace() || c.is_control() {
+                    '-'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let trimmed = replaced.trim_start_matches(['.', '-']);
+        if !trimmed.chars().any(char::is_alphanumeric) {
+            return None;
+        }
+        Self::new(trimmed).ok()
+    }
+
     /// The name as a string slice.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
@@ -94,6 +124,11 @@ pub enum HostError {
         source: PackageNameError,
     },
 }
+
+/// Every key a host profile accepts. Keep this in step with `RawProfile`
+/// below, and document each key in the starter profile that `init` writes; a
+/// test fails until the starter mentions every key listed here.
+pub const PROFILE_KEYS: [&str; 1] = ["packages"];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,8 +230,10 @@ pub fn select_host(
         }
         return Ok(Some(SelectedHost { name, source }));
     }
+    // The hostname is only a guess, and `init` names its profile with the same
+    // conversion, so a hostname that needed one still finds its profile.
     let guessed = hostname
-        .and_then(|name| HostName::new(name).ok())
+        .and_then(HostName::from_hostname)
         .filter(|name| available.contains(name));
     Ok(guessed.map(|name| SelectedHost {
         name,
@@ -422,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hostname_that_is_not_a_valid_profile_name_is_ignored_not_an_error() {
+    fn a_hostname_that_needs_converting_but_has_no_profile_selects_nothing_without_an_error() {
         let chosen = select(None, None, Some("bad name"), &["lenovo"]).unwrap();
 
         assert_eq!(chosen, None);
@@ -497,5 +534,121 @@ mod tests {
             assert!(!name.is_empty());
             assert_eq!(name, name.trim());
         }
+    }
+
+    fn converted(hostname: &str) -> Option<String> {
+        HostName::from_hostname(hostname).map(|name| name.as_str().to_string())
+    }
+
+    #[test]
+    fn a_hostname_that_is_already_a_valid_name_is_unchanged() {
+        for hostname in [
+            "lenovo",
+            "lenovo.local",
+            "host_1",
+            "a..b",
+            "trailing.",
+            "ünï-côdé",
+        ] {
+            assert_eq!(converted(hostname).as_deref(), Some(hostname));
+        }
+    }
+
+    #[test]
+    fn separators_whitespace_and_control_characters_become_dashes() {
+        assert_eq!(converted("my laptop").as_deref(), Some("my-laptop"));
+        assert_eq!(converted("a/b").as_deref(), Some("a-b"));
+        assert_eq!(converted("a\tb").as_deref(), Some("a-b"));
+        assert_eq!(converted("a\nb").as_deref(), Some("a-b"));
+    }
+
+    #[test]
+    fn leading_dots_and_dashes_are_dropped() {
+        assert_eq!(converted(".hidden").as_deref(), Some("hidden"));
+        assert_eq!(converted("-flag").as_deref(), Some("flag"));
+        assert_eq!(converted("../../etc").as_deref(), Some("etc"));
+        assert_eq!(converted(".-.name").as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn a_hostname_with_nothing_usable_in_it_has_no_name() {
+        for hostname in ["", "   ", "...", "---", ".-.", "\u{0}", "\t\n"] {
+            assert_eq!(converted(hostname), None, "{hostname:?}");
+        }
+    }
+
+    #[test]
+    fn a_converted_name_is_always_accepted_by_the_strict_constructor() {
+        let hostnames = [
+            "lenovo.local",
+            "my laptop",
+            "a/b",
+            "../../etc",
+            ".hidden",
+            "-flag",
+            "a\tb",
+            "x y/z",
+            "ünï",
+            "a.b.c.d",
+            "UPPER",
+        ];
+
+        for hostname in hostnames {
+            let name = HostName::from_hostname(hostname).unwrap();
+            assert_eq!(
+                HostName::new(name.as_str()).unwrap(),
+                name,
+                "{hostname:?} -> {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_converted_name_can_never_escape_the_hosts_directory_or_look_like_a_flag() {
+        let hostnames = [
+            "../../etc/passwd",
+            "/abs/olute",
+            "a/../b",
+            "..",
+            "-rf",
+            "--help",
+        ];
+
+        for hostname in hostnames {
+            if let Some(name) = HostName::from_hostname(hostname) {
+                let name = name.as_str();
+                assert!(!name.contains('/'), "{hostname:?} -> {name}");
+                assert!(!name.starts_with('.'), "{hostname:?} -> {name}");
+                assert!(!name.starts_with('-'), "{hostname:?} -> {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_hostname_selects_a_profile_that_was_named_with_the_converted_name() {
+        let chosen = select(None, None, Some("my laptop"), &["my-laptop"]).unwrap();
+
+        assert_eq!(chosen, selected("my-laptop", HostSource::Hostname));
+    }
+
+    #[test]
+    fn a_hostname_that_needed_no_conversion_still_selects_its_profile() {
+        let chosen = select(None, None, Some("lenovo.local"), &["lenovo.local"]).unwrap();
+
+        assert_eq!(chosen, selected("lenovo.local", HostSource::Hostname));
+    }
+
+    #[test]
+    fn a_hostname_with_nothing_usable_selects_nothing() {
+        let chosen = select(None, None, Some("..."), &["lenovo"]).unwrap();
+
+        assert_eq!(chosen, None);
+    }
+
+    #[test]
+    fn an_explicit_host_name_is_not_converted() {
+        let error = select(Some("my laptop"), None, None, &["my-laptop"]).unwrap_err();
+
+        assert!(matches!(error, HostError::InvalidName(_)));
     }
 }
