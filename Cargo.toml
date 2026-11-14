@@ -12,6 +12,7 @@ anyhow = "1"
 assert_cmd = "2"
 clap = { version = "4", features = ["derive"] }
 predicates = "3"
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 thiserror = "2"
