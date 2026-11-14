@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/puddlejump-core", "crates/puddlejump"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+assert_cmd = "2"
+clap = { version = "4", features = ["derive"] }
+predicates = "3"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
