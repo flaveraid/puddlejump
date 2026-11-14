@@ -53,7 +53,7 @@ The host is chosen by `--host`, then `$PUDDLEJUMP_HOST`, then the machine's host
 
 ## Usage
 
-Create a repo with `puddlejump init ~/dotfiles`, then run from it, or pass `--repo <dir>`.
+Create a repo with `puddlejump init ~/dotfiles` (it writes starter files that document every option), then run from it, or pass `--repo <dir>`.
 
 ```
 puddlejump link [packages...]     # link, install system packages, run hooks

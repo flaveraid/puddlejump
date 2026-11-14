@@ -391,3 +391,81 @@ fn init_dry_run_with_json_prints_one_parseable_plan() {
     assert_eq!(plan["steps"].as_array().unwrap().len(), 5);
     assert!(!repo.exists());
 }
+
+#[test]
+fn the_host_profile_init_creates_is_selected_automatically_for_this_machine() {
+    let sandbox = Sandbox::new();
+    let repo = new_repo(&sandbox);
+    sandbox
+        .command_without_repo()
+        .arg("init")
+        .arg(&repo)
+        .assert()
+        .success();
+    let profile = host_profiles(&repo).remove(0);
+    let name = profile.strip_suffix(".toml").unwrap().to_string();
+
+    // No --host and no PUDDLEJUMP_HOST: only the machine's own hostname can
+    // pick it, so this holds whatever the hostname is and however it was
+    // converted to a filename.
+    sandbox
+        .command_without_repo()
+        .arg("--repo")
+        .arg(&repo)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{name}  (selected)")));
+}
+
+#[test]
+fn the_host_profile_name_is_a_safe_filename() {
+    let sandbox = Sandbox::new();
+    let repo = new_repo(&sandbox);
+    sandbox
+        .command_without_repo()
+        .arg("init")
+        .arg(&repo)
+        .assert()
+        .success();
+
+    for profile in host_profiles(&repo) {
+        let name = profile.strip_suffix(".toml").unwrap();
+        assert!(!name.is_empty());
+        assert!(!name.starts_with('.') && !name.starts_with('-'), "{name}");
+        assert!(
+            !name.contains('/') && !name.chars().any(char::is_whitespace),
+            "{name}"
+        );
+    }
+    assert!(repo
+        .join("hosts")
+        .read_dir()
+        .unwrap()
+        .all(|entry| entry.unwrap().path().starts_with(repo.join("hosts"))));
+}
+
+#[test]
+fn the_starter_files_mention_every_key_so_they_can_be_edited_without_the_docs() {
+    let sandbox = Sandbox::new();
+    let repo = new_repo(&sandbox);
+    sandbox
+        .command_without_repo()
+        .arg("init")
+        .arg(&repo)
+        .assert()
+        .success();
+
+    let config = fs::read_to_string(repo.join("puddlejump.toml")).unwrap();
+    let profile = fs::read_to_string(repo.join("hosts").join(&host_profiles(&repo)[0])).unwrap();
+
+    for key in puddlejump_core::config::CONFIG_KEYS {
+        assert!(config.contains(key), "puddlejump.toml never mentions {key}");
+    }
+    for key in puddlejump_core::host::PROFILE_KEYS {
+        assert!(
+            profile.contains(key),
+            "the host profile never mentions {key}"
+        );
+    }
+}

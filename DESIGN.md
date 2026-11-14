@@ -163,15 +163,28 @@ Global flags: `--repo <dir>` (default `$PUDDLEJUMP_REPO`, else cwd),
 ### `init`
 
 `init PATH` creates `PATH/`, `puddlejump.toml`, `hosts/`, `packages/`, and
-`hosts/<hostname>.toml`. The config is all comments and the host profile lists
-no packages, so a new repo behaves as if it had no config. It never overwrites:
-anything that already exists is skipped, which makes it safe to run again, in a
-directory that already has a README or `.git`, or on a second machine to add its
-profile. A path in the way (a file where a directory is needed, or the reverse)
-refuses the whole plan before anything is created. If the hostname is unknown or
-cannot be a profile name, only the profile is left out and a note says why. It
-does not add `.gitkeep` files, so an empty `packages/` is not tracked by git
-until it has something in it, and it does not run `git init`.
+`hosts/<hostname>.toml`. Each starter file lists every key its parser accepts,
+with a comment and an example, so it can be edited without reading the docs. The
+config key is commented out (setting `package_manager` would make a machine
+without that manager an error) and the host profile has `packages = []`, so a
+new repo behaves as if it had no config. It never overwrites: anything that
+already exists is skipped, which makes it safe to run again, in a directory that
+already has a README or `.git`, or on a second machine to add its profile. A path
+in the way (a file where a directory is needed, or the reverse) refuses the whole
+plan before anything is created.
+
+The hostname becomes the profile's filename, so it is made safe first: path
+separators, whitespace, and control characters become `-`, and leading dots and
+dashes are dropped (never a hidden file, never a lookalike for a flag). A valid
+name such as `lenovo.local` is unchanged. Host selection applies the same
+conversion to the machine's hostname before matching, so a profile made for a
+machine is found by that machine; `--host` and `$PUDDLEJUMP_HOST` are not
+converted, since a name typed by the user means exactly that name. If nothing
+usable is left (an empty hostname, or only dots, dashes, or whitespace) only the
+profile is left out and a note says why. `init` does not add `.gitkeep` files,
+so an empty `packages/` is not tracked by git until it has something in it, and
+it does not run `git init`. When a parser gains a key, its `*_KEYS` constant
+must list it, and a test fails until the starter documents it.
 
 ### CLI behavior decisions
 
