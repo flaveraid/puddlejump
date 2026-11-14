@@ -10,6 +10,7 @@ pub mod execute;
 pub mod graph;
 pub mod hook;
 pub mod host;
+pub mod init;
 pub mod link;
 pub mod manifest;
 pub mod package;

@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::manifest::{Manifest, ManifestPathError, MANIFEST_FILE_NAME};
 
 /// Directory under the repo root that holds the packages.
-const PACKAGES_DIR_NAME: &str = "packages";
+pub const PACKAGES_DIR_NAME: &str = "packages";
 
 /// Names that are never linked, wherever they appear in a package.
 const NEVER_LINKED: [&str; 2] = [".git", ".gitkeep"];

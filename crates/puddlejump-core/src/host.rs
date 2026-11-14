@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::package::{PackageName, PackageNameError};
 
 /// Directory under the repo root that holds host profiles.
-const HOSTS_DIR_NAME: &str = "hosts";
+pub const HOSTS_DIR_NAME: &str = "hosts";
 
 /// Where the kernel exposes the machine's hostname.
 const KERNEL_HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
