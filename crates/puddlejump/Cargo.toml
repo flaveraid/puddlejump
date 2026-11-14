@@ -11,7 +11,12 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+puddlejump-core = { path = "../puddlejump-core" }
+rustix = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+tempfile.workspace = true
