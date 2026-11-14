@@ -12,6 +12,7 @@ use crate::package::{PackageName, Repo};
 
 pub mod command;
 pub mod privilege;
+pub mod privileged_writer;
 pub mod xbps;
 
 /// Every package manager puddlejump knows, in the order auto-detection tries

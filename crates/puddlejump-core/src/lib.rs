@@ -3,11 +3,20 @@
 //! This crate holds all logic. It returns data and errors and knows nothing
 //! about terminals or windows; frontends decide how to present results.
 
+pub mod adopt;
+pub mod apply;
 pub mod config;
+pub mod execute;
 pub mod graph;
+pub mod hook;
 pub mod host;
 pub mod link;
 pub mod manifest;
 pub mod package;
 pub mod plan;
+pub mod session;
+pub mod status;
 pub mod system;
+
+#[cfg(test)]
+mod test_scripts;
