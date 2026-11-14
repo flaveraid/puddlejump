@@ -53,7 +53,7 @@ The host is chosen by `--host`, then `$PUDDLEJUMP_HOST`, then the machine's host
 
 ## Usage
 
-Run from the repo directory, or pass `--repo <dir>`.
+Create a repo with `puddlejump init ~/dotfiles`, then run from it, or pass `--repo <dir>`.
 
 ```
 puddlejump link [packages...]     # link, install system packages, run hooks
@@ -63,6 +63,7 @@ puddlejump adopt <package> <paths...>   # move existing files into a package and
 puddlejump hook <packages...>     # run hooks only
 puddlejump status [packages...]   # what is linked, missing, or in the way
 puddlejump list                   # packages and host profiles
+puddlejump init <path>            # create a new dotfiles repo at <path>
 ```
 
 With no packages named, `link` uses the host profile, or asks before linking everything.

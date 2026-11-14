@@ -149,6 +149,7 @@ Global flags: `--repo <dir>` (default `$PUDDLEJUMP_REPO`, else cwd),
 | `adopt PACKAGE PATH...` | Move real files into the package, then link them. | `-n` |
 | `status [PACKAGE...]` | Per-package state; missing system deps. | |
 | `list` | Packages and host profiles. | |
+| `init PATH` | Create a new repo at PATH. PATH is required; missing parents are created. `--repo` is ignored. | `-n` |
 
 - Every mutating command supports `--dry-run` (build the plan, do not apply).
 - `--prune` removes directories left empty by the unlink, only on the path of
@@ -158,6 +159,19 @@ Global flags: `--repo <dir>` (default `$PUDDLEJUMP_REPO`, else cwd),
   manifest).
 - Conflicts never overwrite real files. `adopt` is the explicit way to move an
   existing file into a package.
+
+### `init`
+
+`init PATH` creates `PATH/`, `puddlejump.toml`, `hosts/`, `packages/`, and
+`hosts/<hostname>.toml`. The config is all comments and the host profile lists
+no packages, so a new repo behaves as if it had no config. It never overwrites:
+anything that already exists is skipped, which makes it safe to run again, in a
+directory that already has a README or `.git`, or on a second machine to add its
+profile. A path in the way (a file where a directory is needed, or the reverse)
+refuses the whole plan before anything is created. If the hostname is unknown or
+cannot be a profile name, only the profile is left out and a note says why. It
+does not add `.gitkeep` files, so an empty `packages/` is not tracked by git
+until it has something in it, and it does not run `git init`.
 
 ### CLI behavior decisions
 

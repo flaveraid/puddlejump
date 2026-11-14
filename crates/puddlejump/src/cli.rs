@@ -46,6 +46,8 @@ pub enum Command {
     Status(StatusArgs),
     /// List the packages and host profiles in the repo.
     List,
+    /// Create a new dotfiles repo at PATH (ignores --repo).
+    Init(InitArgs),
 }
 
 /// Arguments of `link`.
@@ -113,6 +115,17 @@ pub struct AdoptArgs {
     pub paths: Vec<PathBuf>,
 
     /// Show what would happen without changing anything.
+    #[arg(short = 'n', long)]
+    pub dry_run: bool,
+}
+
+/// Arguments of `init`.
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Where to create the repo. Missing directories are created.
+    pub path: PathBuf,
+
+    /// Show what would be created without creating anything.
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 }
@@ -224,6 +237,31 @@ mod tests {
     }
 
     #[test]
+    fn init_requires_a_path() {
+        assert!(parse(&["init"]).is_err());
+    }
+
+    #[test]
+    fn init_takes_a_path_and_dry_run() {
+        let Command::Init(args) = parse(&["init", "/new/dotfiles", "-n"]).unwrap().command else {
+            panic!("expected init");
+        };
+
+        assert_eq!(args.path, PathBuf::from("/new/dotfiles"));
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn init_takes_only_one_path() {
+        assert!(parse(&["init", "/a", "/b"]).is_err());
+    }
+
+    #[test]
+    fn init_accepts_but_does_not_need_the_global_repo_flag() {
+        assert!(parse(&["--repo", "/ignored", "init", "/new"]).is_ok());
+    }
+
+    #[test]
     fn a_subcommand_is_required() {
         assert!(parse(&[]).is_err());
     }
@@ -242,6 +280,7 @@ mod tests {
             &["relink", "--dry-run"],
             &["hook", "x", "--dry-run"],
             &["adopt", "x", "/p", "--dry-run"],
+            &["init", "/p", "--dry-run"],
         ] {
             assert!(
                 parse(command).is_ok(),

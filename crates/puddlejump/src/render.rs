@@ -8,6 +8,7 @@ use puddlejump_core::apply::{ActionResult, PackageOutcome};
 use puddlejump_core::execute::{InstallOutcome, Report};
 use puddlejump_core::hook::{HookOutcome, HookResult};
 use puddlejump_core::host::HostName;
+use puddlejump_core::init::{InitConflict, InitNote, InitOutcome, InitPlan, InitResult, InitStep};
 use puddlejump_core::package::PackageName;
 use puddlejump_core::plan::{Action, ConflictKind, PackageActions, Plan, PlanWarning, RootReason};
 use puddlejump_core::status::{FileState, PackageState, PackageStatus, SystemStatus};
@@ -359,6 +360,74 @@ fn adopt_line(action: &AdoptAction) -> String {
             format!("REFUSED {}: {}", path.display(), adopt_refusal(reason))
         }
     }
+}
+
+fn init_conflict(conflict: &InitConflict) -> &'static str {
+    match conflict {
+        InitConflict::NotADirectory => "a directory is needed but something else is there",
+        InitConflict::NotAFile => "a file is needed but something else is there",
+    }
+}
+
+fn init_line(step: &InitStep) -> String {
+    match step {
+        InitStep::CreateDirectory { path } => format!("create  {}/", path.display()),
+        InitStep::CreateFile { path, .. } => format!("create  {}", path.display()),
+        InitStep::Skip { path, .. } => format!("exists  {}", path.display()),
+        InitStep::Conflict { path, kind } => {
+            format!("CONFLICT {}: {}", path.display(), init_conflict(kind))
+        }
+    }
+}
+
+fn init_note(note: &InitNote) -> String {
+    match note {
+        InitNote::NoHostProfile { reason } => {
+            format!("no host profile was created: {reason}")
+        }
+    }
+}
+
+/// Renders what initializing would do.
+pub fn init_plan(plan: &InitPlan) -> String {
+    let mut out = String::new();
+    line!(out, "{}:", plan.root.display());
+    for step in &plan.steps {
+        line!(out, "  {}", init_line(step));
+    }
+    for note in &plan.notes {
+        line!(out, "note: {}", init_note(note));
+    }
+    out
+}
+
+/// Renders only the conflicts in `plan`, one per line.
+pub fn init_conflicts(plan: &InitPlan) -> String {
+    let mut out = String::new();
+    for step in &plan.steps {
+        if matches!(step, InitStep::Conflict { .. }) {
+            line!(out, "  {}", init_line(step));
+        }
+    }
+    out
+}
+
+/// Renders what initializing did.
+pub fn init_outcomes(plan: &InitPlan, outcomes: &[InitOutcome]) -> String {
+    let mut out = String::new();
+    line!(out, "{}:", plan.root.display());
+    for outcome in outcomes {
+        let text = init_line(&outcome.step);
+        match &outcome.result {
+            InitResult::Created => line!(out, "  {text}  [done]"),
+            InitResult::Skipped => line!(out, "  {text}"),
+            InitResult::Failed { reason } => line!(out, "  {text}  [FAILED: {reason}]"),
+        }
+    }
+    for note in &plan.notes {
+        line!(out, "note: {}", init_note(note));
+    }
+    out
 }
 
 /// Renders what adopting would do.
@@ -1104,5 +1173,151 @@ mod tests {
                 "  move    /h/c -> /r/c  [FAILED: disk full]",
             ]
         );
+    }
+
+    fn init_step_dir(path: &str) -> InitStep {
+        InitStep::CreateDirectory {
+            path: self::path(path),
+        }
+    }
+
+    fn init_step_file(path: &str) -> InitStep {
+        InitStep::CreateFile {
+            path: self::path(path),
+            contents: "x".to_string(),
+        }
+    }
+
+    fn init_plan_of(steps: Vec<InitStep>, notes: Vec<InitNote>) -> InitPlan {
+        InitPlan {
+            root: path("/r"),
+            steps,
+            notes,
+        }
+    }
+
+    #[test]
+    fn an_init_plan_lists_each_step_and_marks_directories() {
+        let plan = init_plan_of(
+            vec![
+                init_step_dir("/r"),
+                init_step_file("/r/puddlejump.toml"),
+                InitStep::Skip {
+                    path: path("/r/hosts"),
+                    reason: puddlejump_core::init::InitSkip::AlreadyExists,
+                },
+            ],
+            vec![],
+        );
+
+        assert_eq!(
+            lines(&init_plan(&plan)),
+            [
+                "/r:",
+                "  create  /r/",
+                "  create  /r/puddlejump.toml",
+                "  exists  /r/hosts",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_init_plan_explains_a_missing_host_profile() {
+        let plan = init_plan_of(
+            vec![init_step_dir("/r")],
+            vec![InitNote::NoHostProfile {
+                reason: "the machine's hostname is unknown".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            lines(&init_plan(&plan)),
+            [
+                "/r:",
+                "  create  /r/",
+                "note: no host profile was created: the machine's hostname is unknown",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_kind_of_init_conflict_has_its_own_wording() {
+        let cases = [
+            (
+                InitConflict::NotADirectory,
+                "a directory is needed but something else is there",
+            ),
+            (
+                InitConflict::NotAFile,
+                "a file is needed but something else is there",
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(init_conflict(&kind), expected);
+        }
+    }
+
+    #[test]
+    fn init_conflicts_shows_only_the_paths_in_the_way() {
+        let plan = init_plan_of(
+            vec![
+                init_step_dir("/r"),
+                init_step_file("/r/puddlejump.toml"),
+                InitStep::Conflict {
+                    path: path("/r/packages"),
+                    kind: InitConflict::NotADirectory,
+                },
+            ],
+            vec![],
+        );
+
+        assert_eq!(
+            lines(&init_conflicts(&plan)),
+            ["  CONFLICT /r/packages: a directory is needed but something else is there"]
+        );
+    }
+
+    #[test]
+    fn init_outcomes_show_each_result() {
+        let plan = init_plan_of(vec![], vec![]);
+        let outcomes = [
+            InitOutcome {
+                step: init_step_dir("/r"),
+                result: InitResult::Created,
+            },
+            InitOutcome {
+                step: init_step_file("/r/a.toml"),
+                result: InitResult::Skipped,
+            },
+            InitOutcome {
+                step: init_step_dir("/r/hosts"),
+                result: InitResult::Failed {
+                    reason: "Permission denied".to_string(),
+                },
+            },
+        ];
+
+        assert_eq!(
+            lines(&init_outcomes(&plan, &outcomes)),
+            [
+                "/r:",
+                "  create  /r/  [done]",
+                "  create  /r/a.toml",
+                "  create  /r/hosts/  [FAILED: Permission denied]",
+            ]
+        );
+    }
+
+    #[test]
+    fn init_outcomes_repeat_the_notes() {
+        let plan = init_plan_of(
+            vec![],
+            vec![InitNote::NoHostProfile {
+                reason: "unknown".to_string(),
+            }],
+        );
+
+        assert!(init_outcomes(&plan, &[]).contains("note: no host profile was created: unknown"));
     }
 }

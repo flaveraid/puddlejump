@@ -13,6 +13,7 @@ use puddlejump_core::execute::{
 };
 use puddlejump_core::graph::DependencyGraph;
 use puddlejump_core::hook::{run_hooks, HookObserver, HookOutputStream, HookResult};
+use puddlejump_core::init::{execute_init, init_verdict, plan_init, InitError, InitPlan};
 use puddlejump_core::link::RealFileSystem;
 use puddlejump_core::package::PackageName;
 use puddlejump_core::plan::{
@@ -25,7 +26,7 @@ use puddlejump_core::system::command::SystemCommandRunner;
 use puddlejump_core::system::privilege::Privilege;
 use puddlejump_core::system::{build_manager, detect, ManagerId, PackageManager};
 
-use crate::cli::{AdoptArgs, Cli, Command, HookArgs, LinkArgs, StatusArgs, UnlinkArgs};
+use crate::cli::{AdoptArgs, Cli, Command, HookArgs, InitArgs, LinkArgs, StatusArgs, UnlinkArgs};
 use crate::{environment, prompt, render};
 
 /// How a command ended, which decides the process exit status.
@@ -181,16 +182,19 @@ impl Environment {
 /// Errors only for problems that are not a refusal or a failure of the work
 /// itself, such as an unreadable repo or a broken terminal.
 pub fn run(cli: &Cli, environment: &Environment, terminal: &mut Terminal) -> Result<Outcome> {
-    let session = open_session(cli, environment)?;
     let json = cli.json;
+    // Only `init` runs without an existing repo, so it must not open one. Every
+    // other command opens the session lazily, here, once.
+    let session = || open_session(cli, environment);
     match &cli.command {
-        Command::List => list(&session, json, terminal),
-        Command::Status(args) => status(&session, args, environment, json, terminal),
-        Command::Link(args) => link(&session, args, environment, json, terminal),
-        Command::Unlink(args) => unlink(&session, args, environment, json, terminal),
-        Command::Relink(args) => relink(&session, args, environment, json, terminal),
-        Command::Hook(args) => hook(&session, args, json, terminal),
-        Command::Adopt(args) => adopt(&session, args, environment, json, terminal),
+        Command::Init(args) => init(args, environment, json, terminal),
+        Command::List => list(&session()?, json, terminal),
+        Command::Status(args) => status(&session()?, args, environment, json, terminal),
+        Command::Link(args) => link(&session()?, args, environment, json, terminal),
+        Command::Unlink(args) => unlink(&session()?, args, environment, json, terminal),
+        Command::Relink(args) => relink(&session()?, args, environment, json, terminal),
+        Command::Hook(args) => hook(&session()?, args, json, terminal),
+        Command::Adopt(args) => adopt(&session()?, args, environment, json, terminal),
     }
 }
 
@@ -680,4 +684,44 @@ fn adopt(
         terminal.show(&render::file_report(&report.linked))?;
     }
     Ok(report.verdict().into())
+}
+
+fn init(
+    args: &InitArgs,
+    environment: &Environment,
+    as_json: bool,
+    terminal: &mut Terminal,
+) -> Result<Outcome> {
+    let plan = match plan_init(&args.path, environment.hostname.as_deref(), &RealFileSystem) {
+        Ok(plan) => plan,
+        Err(error) => return terminal.refuse(error),
+    };
+    if args.dry_run {
+        if as_json {
+            terminal.show_json(&plan)?;
+        } else {
+            terminal.show(&render::init_plan(&plan))?;
+        }
+        return Ok(Outcome::Success);
+    }
+    let outcomes = match execute_init(&plan, &RealFileSystem) {
+        Ok(outcomes) => outcomes,
+        Err(error) => return refuse_init(&plan, &error, terminal),
+    };
+    if as_json {
+        terminal.show_json(&outcomes)?;
+    } else {
+        terminal.show(&render::init_outcomes(&plan, &outcomes))?;
+    }
+    Ok(init_verdict(&outcomes).into())
+}
+
+/// Reports why a repo was not created, naming each path in the way. Only the
+/// conflicts are shown: nothing else was created, so listing the rest of the
+/// plan would read as if it had been.
+fn refuse_init(plan: &InitPlan, error: &InitError, terminal: &mut Terminal) -> Result<Outcome> {
+    terminal.warn(&format!("error: {error}:"))?;
+    terminal.warn(render::init_conflicts(plan).trim_end())?;
+    terminal.warn("nothing was created")?;
+    Ok(Outcome::Refused)
 }
