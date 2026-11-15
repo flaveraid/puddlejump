@@ -52,6 +52,8 @@ crates/
 - Names are full words: `package_dir`, not `pkg_d`.
 - Doc comments (`///`) on every public item in `core`, saying what it does
   and when it errors. Inline comments explain *why*, never *what*.
+- Code comments must reflect the working state of the code. When behavior
+  changes, update or remove the comments that describe it.
 - No dead code, commented-out code, or TODOs left behind without an issue.
 - Paths: use `std::path::Path`/`PathBuf` throughout, never string paths.
 
@@ -91,6 +93,8 @@ is not done.
 - For anything non-trivial, propose a short plan and wait for approval
   before writing code.
 - Make small, focused changes. One concern per commit.
+- When a feature or bug has been addressed, ask the user whether they want
+  to commit the changes. Don't commit without their go-ahead.
 - If a request is ambiguous or conflicts with these rules, ask. Don't guess.
 - Don't add features, flags, or crates beyond what the task asks for. If you
   think something is missing, suggest it instead of building it.
