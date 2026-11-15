@@ -538,6 +538,57 @@ fn hooks_run_in_dependency_order() {
     assert!(stdout.find("[base] base").unwrap() < stdout.find("[app] app").unwrap());
 }
 
+/// `app` depends on `base`; both have hooks that append to a log in the home
+/// directory, so a test can count how often each ran.
+fn app_and_base_with_logging_hooks() -> (Sandbox, std::path::PathBuf) {
+    let sandbox = Sandbox::new();
+    let log = sandbox.home().join("hook-runs");
+    for package in ["base", "app"] {
+        sandbox.package_file(package, &format!(".{package}rc"), "");
+        sandbox.package_script(
+            package,
+            "hook.sh",
+            &format!("echo {package} >> {}", log.display()),
+        );
+    }
+    sandbox.manifest("base", "hook = \"hook.sh\"");
+    sandbox.manifest("app", "depends = [\"base\"]\nhook = \"hook.sh\"");
+    (sandbox, log)
+}
+
+#[test]
+fn linking_a_package_does_not_re_run_the_hook_of_an_already_linked_dependency() {
+    let (sandbox, log) = app_and_base_with_logging_hooks();
+    sandbox
+        .command()
+        .args(["link", "base", "--yes"])
+        .assert()
+        .success();
+
+    sandbox
+        .command()
+        .args(["link", "app"])
+        .write_stdin("")
+        .assert()
+        .success();
+
+    assert_eq!(fs::read_to_string(log).unwrap(), "base\napp\n");
+}
+
+#[test]
+fn linking_a_package_still_runs_the_hook_of_a_dependency_that_is_not_linked_yet() {
+    let (sandbox, log) = app_and_base_with_logging_hooks();
+
+    sandbox
+        .command()
+        .args(["link", "app"])
+        .write_stdin("")
+        .assert()
+        .success();
+
+    assert_eq!(fs::read_to_string(log).unwrap(), "base\napp\n");
+}
+
 #[test]
 fn a_hook_that_is_not_executable_is_reported_and_exits_one() {
     let sandbox = Sandbox::new();

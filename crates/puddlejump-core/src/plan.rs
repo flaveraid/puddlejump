@@ -244,6 +244,11 @@ pub enum PlanError {
 /// Plans everything `link` does for the packages in `graph`: file actions,
 /// system package installs, and hooks, all in dependency order.
 ///
+/// `named` is what the user asked for. A hook runs for a named package, or for
+/// a dependency that has something to link in this run; a dependency that is
+/// not named and is already fully linked is left alone, so its hook does not
+/// run again.
+///
 /// Installing system packages adds [`RootReason::SystemInstall`].
 ///
 /// Errors if a package's files cannot be listed, a path cannot be inspected,
@@ -251,6 +256,7 @@ pub enum PlanError {
 pub fn plan_full_link(
     context: &PlanContext,
     graph: &DependencyGraph,
+    named: &[PackageName],
     state: &dyn FileSystemState,
     manager: Option<&dyn PackageManager>,
 ) -> Result<Plan, PlanError> {
@@ -260,9 +266,10 @@ pub fn plan_full_link(
     if !system.to_install.is_empty() {
         needs_root.push(RootReason::SystemInstall);
     }
+    let hooks = hooks_to_run(hooks_in_order(context, graph), named, &files.packages);
     Ok(Plan {
         packages: files.packages,
-        hooks: hooks_in_order(context, graph),
+        hooks,
         system,
         needs_root,
         warnings: files.warnings,
@@ -275,10 +282,7 @@ impl Plan {
     /// False means everything is already linked, which is when `link` asks
     /// before running hooks again.
     pub fn links_anything(&self) -> bool {
-        self.packages
-            .iter()
-            .flat_map(|package| &package.actions)
-            .any(|action| matches!(action, Action::Link { .. } | Action::LinkSymlinkCopy { .. }))
+        self.packages.iter().any(links_something)
     }
 
     /// Whether running this plan would re-run hooks on packages that are
@@ -289,6 +293,49 @@ impl Plan {
     pub fn needs_hook_confirmation(&self, hooks_enabled: bool) -> bool {
         hooks_enabled && !self.hooks.is_empty() && !self.links_anything()
     }
+}
+
+/// Drops the hook of a package the user did not name when that package is
+/// already fully linked.
+///
+/// A package with no actions at all (it has a hook but no files) is not
+/// "already linked", since there is nothing to be linked, so its hook stays.
+fn hooks_to_run(
+    hooks: Vec<HookPlan>,
+    named: &[PackageName],
+    packages: &[PackageActions],
+) -> Vec<HookPlan> {
+    hooks
+        .into_iter()
+        .filter(|hook| {
+            named.contains(&hook.package)
+                || !packages
+                    .iter()
+                    .any(|package| package.package == hook.package && is_fully_linked(package))
+        })
+        .collect()
+}
+
+/// Whether `package` has files and every one of them is already in place.
+fn is_fully_linked(package: &PackageActions) -> bool {
+    !package.actions.is_empty()
+        && package.actions.iter().all(|action| {
+            matches!(
+                action,
+                Action::Skip {
+                    reason: SkipReason::AlreadyLinked,
+                    ..
+                }
+            )
+        })
+}
+
+/// Whether applying `package` would create at least one link.
+fn links_something(package: &PackageActions) -> bool {
+    package
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::Link { .. } | Action::LinkSymlinkCopy { .. }))
 }
 
 /// Plans running the hooks of exactly the named packages, in dependency order.
@@ -1797,6 +1844,7 @@ mod tests {
         plan_full_link(
             &context(repo, Path::new(HOME)),
             &graph,
+            &names(roots),
             &FakeFileSystem::default(),
             manager,
         )
@@ -1913,14 +1961,25 @@ mod tests {
         );
     }
 
+    /// A full plan for just `zsh` against `filesystem`, with no package manager.
+    fn plan_zsh(repo: &Repo, graph: &DependencyGraph, filesystem: &FakeFileSystem) -> Plan {
+        plan_full_link(
+            &context(repo, Path::new(HOME)),
+            graph,
+            &names(&["zsh"]),
+            filesystem,
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn file_warnings_are_carried_into_the_full_plan() {
         let (_root, repo) = repo_on_disk(&[package("zsh", &["current"])]);
         let graph = DependencyGraph::build(&repo, &names(&["zsh"])).unwrap();
         let filesystem = package_symlink(&repo, "zsh", "current", "../relative");
 
-        let plan =
-            plan_full_link(&context(&repo, Path::new(HOME)), &graph, &filesystem, None).unwrap();
+        let plan = plan_zsh(&repo, &graph, &filesystem);
 
         assert_eq!(plan.warnings.len(), 1);
     }
@@ -1969,8 +2028,7 @@ mod tests {
             source(&repo, "zsh", ".zshrc").to_str().unwrap(),
         );
 
-        let plan =
-            plan_full_link(&context(&repo, Path::new(HOME)), &graph, &filesystem, None).unwrap();
+        let plan = plan_zsh(&repo, &graph, &filesystem);
 
         assert!(!plan.links_anything());
     }
@@ -1981,8 +2039,7 @@ mod tests {
         let graph = DependencyGraph::build(&repo, &names(&["zsh"])).unwrap();
         let filesystem = package_symlink(&repo, "zsh", "current", "/opt/zsh");
 
-        let plan =
-            plan_full_link(&context(&repo, Path::new(HOME)), &graph, &filesystem, None).unwrap();
+        let plan = plan_zsh(&repo, &graph, &filesystem);
 
         assert!(plan.links_anything());
     }
@@ -2005,7 +2062,14 @@ mod tests {
                 source(&repo, "dwm", ".dwmrc").to_str().unwrap(),
             );
         }
-        plan_full_link(&context(&repo, Path::new(HOME)), &graph, &filesystem, None).unwrap()
+        plan_full_link(
+            &context(&repo, Path::new(HOME)),
+            &graph,
+            &names(&["dwm"]),
+            &filesystem,
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2031,8 +2095,7 @@ mod tests {
             home_path(".zshrc").to_str().unwrap(),
             source(&repo, "zsh", ".zshrc").to_str().unwrap(),
         );
-        let plan =
-            plan_full_link(&context(&repo, Path::new(HOME)), &graph, &filesystem, None).unwrap();
+        let plan = plan_zsh(&repo, &graph, &filesystem);
 
         assert!(!plan.needs_hook_confirmation(true));
     }
@@ -2071,6 +2134,98 @@ mod tests {
         let hooks = hook_plan(&repo, &["plain", "dwm"]).unwrap();
 
         assert_eq!(hook_packages(&hooks), ["dwm"]);
+    }
+
+    /// A plan for `named` where `app` depends on `base`, both with hooks, and
+    /// `base` is already linked or not.
+    fn plan_with_dependency_hook(named: &[&str], base_already_linked: bool) -> Plan {
+        let (_root, repo) = repo_on_disk(&[
+            package("app", &[".apprc"]).manifest(hooked(&["base"])),
+            package("base", &[".baserc"]).manifest(hooked(&[])),
+        ]);
+        let graph = DependencyGraph::build(&repo, &names(named)).unwrap();
+        let mut filesystem = FakeFileSystem::default();
+        if base_already_linked {
+            filesystem = filesystem.symlink(
+                home_path(".baserc").to_str().unwrap(),
+                source(&repo, "base", ".baserc").to_str().unwrap(),
+            );
+        }
+        plan_full_link(
+            &context(&repo, Path::new(HOME)),
+            &graph,
+            &names(named),
+            &filesystem,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_hook_of_an_already_linked_dependency_is_not_planned() {
+        let plan = plan_with_dependency_hook(&["app"], true);
+
+        assert_eq!(hook_packages(&plan.hooks), ["app"]);
+    }
+
+    #[test]
+    fn the_hook_of_a_dependency_that_is_being_linked_is_planned() {
+        let plan = plan_with_dependency_hook(&["app"], false);
+
+        assert_eq!(hook_packages(&plan.hooks), ["base", "app"]);
+    }
+
+    #[test]
+    fn the_hook_of_a_partly_linked_dependency_is_still_planned() {
+        let (_root, repo) = repo_on_disk(&[
+            package("app", &[".apprc"]).manifest(hooked(&["base"])),
+            package("base", &[".one", ".two"]).manifest(hooked(&[])),
+        ]);
+        let graph = DependencyGraph::build(&repo, &names(&["app"])).unwrap();
+        let filesystem = FakeFileSystem::default().symlink(
+            home_path(".one").to_str().unwrap(),
+            source(&repo, "base", ".one").to_str().unwrap(),
+        );
+
+        let plan = plan_full_link(
+            &context(&repo, Path::new(HOME)),
+            &graph,
+            &names(&["app"]),
+            &filesystem,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(hook_packages(&plan.hooks), ["base", "app"]);
+    }
+
+    #[test]
+    fn the_hook_of_a_dependency_with_no_files_is_still_planned() {
+        // A hook-only package has nothing to link, so it can never be "already
+        // linked"; skipping it would mean its hook never runs as a dependency.
+        let (_root, repo) = repo_on_disk(&[
+            package("app", &[".apprc"]).manifest(hooked(&["setup"])),
+            package("setup", &[]).manifest(hooked(&[])),
+        ]);
+
+        let plan = full_plan(&repo, &["app"], None);
+
+        assert_eq!(hook_packages(&plan.hooks), ["setup", "app"]);
+    }
+
+    #[test]
+    fn the_hook_of_a_named_package_is_planned_even_if_it_is_already_linked() {
+        let plan = plan_with_dependency_hook(&["app", "base"], true);
+
+        assert_eq!(hook_packages(&plan.hooks), ["base", "app"]);
+    }
+
+    #[test]
+    fn an_already_linked_dependency_does_not_force_hook_confirmation() {
+        // `app` is newly linked, so nothing here is a re-run worth asking about.
+        let plan = plan_with_dependency_hook(&["app"], true);
+
+        assert!(!plan.needs_hook_confirmation(true));
     }
 
     #[test]
@@ -2138,6 +2293,7 @@ mod tests {
         let error = plan_full_link(
             &context(&repo, Path::new(HOME)),
             &graph,
+            &names(&["dwm"]),
             &FakeFileSystem::default(),
             Some(&Failing),
         )

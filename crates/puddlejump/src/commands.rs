@@ -377,6 +377,7 @@ fn plan_link_run(
     let plan = match plan_full_link(
         &session.plan_context(),
         &graph,
+        choice.packages(),
         &RealFileSystem,
         manager.as_deref(),
     ) {
