@@ -1,6 +1,6 @@
 //! The xbps backend (Void Linux). The only place that knows xbps commands.
 
-use super::command::{CommandOutput, CommandRunner};
+use super::command::{CommandOutput, CommandRunner, LineCallback};
 use super::privilege::Privilege;
 use super::{ManagerId, PackageManager, SystemError};
 
@@ -46,9 +46,9 @@ impl<R: CommandRunner> PackageManager for Xbps<R> {
         }
     }
 
-    /// Runs a single `xbps-install -y <packages...>`, as root. Does nothing
-    /// for an empty list.
-    fn install(&self, packages: &[String]) -> Result<(), SystemError> {
+    /// Runs a single `xbps-install -y <packages...>`, as root, showing its
+    /// output through `on_line` as it runs. Does nothing for an empty list.
+    fn install(&self, packages: &[String], on_line: LineCallback) -> Result<(), SystemError> {
         if packages.is_empty() {
             return Ok(());
         }
@@ -64,7 +64,7 @@ impl<R: CommandRunner> PackageManager for Xbps<R> {
         let (program, args) = self.privilege.wrap("xbps-install", &args);
         let output = self
             .runner
-            .run(&program, &args)
+            .run_streaming(&program, &args, on_line)
             .map_err(|error| install_error(format!("cannot run {program}: {error}")))?;
         if output.succeeded() {
             Ok(())
@@ -91,6 +91,7 @@ fn failure_reason(output: &CommandOutput) -> String {
 mod tests {
     use super::*;
     use crate::system::command::fake::FakeCommandRunner;
+    use crate::system::command::Stream;
     use std::io;
 
     fn xbps(runner: FakeCommandRunner, privilege: Privilege) -> Xbps<FakeCommandRunner> {
@@ -194,12 +195,79 @@ mod tests {
         ));
     }
 
+    /// Installs `packages` and returns the lines the install wrote.
+    fn install_lines(
+        manager: &Xbps<FakeCommandRunner>,
+        packages: &[&str],
+    ) -> (Result<(), SystemError>, Vec<(Stream, String)>) {
+        let mut lines = Vec::new();
+        let result = manager.install(&strings(packages), &mut |stream, line| {
+            lines.push((stream, line.to_string()))
+        });
+        (result, lines)
+    }
+
+    #[test]
+    fn install_shows_the_output_of_xbps_install_as_it_runs() {
+        let manager = xbps(
+            FakeCommandRunner::new().reply(Ok(CommandOutput {
+                exit_code: Some(0),
+                stdout: "[*] Downloading btop\n[*] Unpacking btop\n".to_string(),
+                stderr: "warning: slow mirror\n".to_string(),
+            })),
+            Privilege::AlreadyRoot,
+        );
+
+        let (result, lines) = install_lines(&manager, &["btop"]);
+
+        result.unwrap();
+        assert_eq!(
+            lines,
+            [
+                (Stream::Stdout, "[*] Downloading btop".to_string()),
+                (Stream::Stdout, "[*] Unpacking btop".to_string()),
+                (Stream::Stderr, "warning: slow mirror".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_install_shows_its_output_and_still_carries_stderr_in_the_error() {
+        let manager = xbps(
+            FakeCommandRunner::new().exit(1, "no space left on device\n"),
+            Privilege::AlreadyRoot,
+        );
+
+        let (result, lines) = install_lines(&manager, &["fd"]);
+
+        assert_eq!(
+            lines,
+            [(Stream::Stderr, "no space left on device".to_string())]
+        );
+        assert!(matches!(
+            result,
+            Err(SystemError::Install { reason, .. }) if reason == "no space left on device"
+        ));
+    }
+
+    #[test]
+    fn a_query_runs_buffered_and_an_install_runs_streaming() {
+        // Queries are internal checks that must stay silent, so only the
+        // install goes through the streaming path.
+        let manager = xbps(FakeCommandRunner::new(), Privilege::AlreadyRoot);
+
+        manager.is_installed("fd").unwrap();
+        install_lines(&manager, &["fd"]).0.unwrap();
+
+        assert_eq!(manager.runner.streamed(), [false, true]);
+    }
+
     #[test]
     fn install_runs_one_xbps_install_for_all_packages() {
         let manager = xbps(FakeCommandRunner::new(), Privilege::AlreadyRoot);
 
-        manager
-            .install(&strings(&["fd", "base-devel", "git"]))
+        install_lines(&manager, &["fd", "base-devel", "git"])
+            .0
             .unwrap();
 
         assert_eq!(
@@ -212,7 +280,7 @@ mod tests {
     fn install_goes_through_sudo_when_not_root() {
         let manager = xbps(FakeCommandRunner::new(), Privilege::UseSudo);
 
-        manager.install(&strings(&["fd"])).unwrap();
+        install_lines(&manager, &["fd"]).0.unwrap();
 
         assert_eq!(manager.runner.lines(), ["sudo xbps-install -y fd"]);
     }
@@ -221,9 +289,11 @@ mod tests {
     fn install_of_nothing_runs_no_command() {
         let manager = xbps(FakeCommandRunner::new(), Privilege::UseSudo);
 
-        manager.install(&[]).unwrap();
+        let (result, lines) = install_lines(&manager, &[]);
 
+        result.unwrap();
         assert!(manager.runner.lines().is_empty());
+        assert!(lines.is_empty());
     }
 
     #[test]
@@ -233,7 +303,7 @@ mod tests {
             Privilege::AlreadyRoot,
         );
 
-        let error = manager.install(&strings(&["fd", "git"])).unwrap_err();
+        let error = install_lines(&manager, &["fd", "git"]).0.unwrap_err();
 
         assert!(matches!(
             error,
@@ -249,7 +319,7 @@ mod tests {
             Privilege::UseSudo,
         );
 
-        let error = manager.install(&strings(&["fd"])).unwrap_err();
+        let error = install_lines(&manager, &["fd"]).0.unwrap_err();
 
         assert!(matches!(
             error,

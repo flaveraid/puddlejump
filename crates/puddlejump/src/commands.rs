@@ -294,7 +294,7 @@ enum HookSink<'a> {
     AllToStderr(&'a mut dyn Write),
 }
 
-/// Prints hook output as it arrives.
+/// Prints hook output, and the system package installer's, as it arrives.
 struct LiveHookOutput<'a> {
     sink: HookSink<'a>,
 }
@@ -334,6 +334,10 @@ impl HookObserver for LiveHookOutput<'_> {
 
     fn output(&mut self, hook: &HookPlan, stream: HookOutputStream, line: &str) {
         let _ = writeln!(self.writer(stream), "[{}] {line}", hook.package);
+    }
+
+    fn install_output(&mut self, stream: HookOutputStream, line: &str) {
+        let _ = writeln!(self.writer(stream), "[install] {line}");
     }
 }
 

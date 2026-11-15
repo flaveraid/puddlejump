@@ -475,7 +475,11 @@ mod tests {
             Ok(self.installed.contains(&package))
         }
 
-        fn install(&self, _packages: &[String]) -> Result<(), SystemError> {
+        fn install(
+            &self,
+            _packages: &[String],
+            _on_line: crate::system::command::LineCallback,
+        ) -> Result<(), SystemError> {
             Ok(())
         }
     }

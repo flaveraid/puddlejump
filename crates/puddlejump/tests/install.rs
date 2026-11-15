@@ -217,10 +217,106 @@ fn a_failing_install_exits_one_keeps_the_links_and_skips_hooks() {
         .assert()
         .code(1)
         .stdout(predicate::str::contains("install FAILED"))
-        .stdout(predicate::str::contains("no space left on device"));
+        .stdout(predicate::str::contains("no space left on device"))
+        .stderr(predicate::str::contains(
+            "[install] no space left on device",
+        ));
 
     assert!(sandbox.home().join("config.h").is_symlink(), "links stay");
     assert!(!marker.exists(), "hooks did not run");
+}
+
+#[test]
+fn the_output_of_xbps_install_is_shown_as_it_runs() {
+    let sandbox = dwm_sandbox(&["btop"]);
+    sandbox.fake_tool("xbps-query", "exit 2");
+    sandbox.fake_tool(
+        "xbps-install",
+        "echo '[*] Downloading btop'\necho 'warning: slow mirror' >&2",
+    );
+    sandbox.fake_sudo();
+
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[install] [*] Downloading btop"))
+        .stderr(predicate::str::contains("[install] warning: slow mirror"))
+        .stdout(predicate::str::contains("installed: btop"));
+}
+
+#[test]
+fn xbps_install_output_comes_before_the_install_result_and_the_hooks() {
+    let sandbox = dwm_sandbox(&["btop"]);
+    sandbox.manifest("dwm", "hook = \"build.sh\"\n[packages]\nxbps = [\"btop\"]");
+    sandbox.package_script("dwm", "build.sh", "echo hook ran");
+    sandbox.fake_tool("xbps-query", "exit 2");
+    sandbox.fake_tool("xbps-install", "echo installing btop");
+    sandbox.fake_sudo();
+
+    let output = sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let installing = stdout.find("installing btop").unwrap();
+    let hook = stdout.find("hook ran").unwrap();
+    assert!(installing < hook, "{stdout}");
+}
+
+#[test]
+fn nothing_is_shown_from_xbps_when_nothing_needs_installing() {
+    let sandbox = dwm_sandbox(&["gcc"]);
+    sandbox.fake_tool("xbps-query", "echo query noise; exit 0");
+    sandbox.fake_tool("xbps-install", "echo install noise");
+    sandbox.fake_sudo();
+
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("noise").not())
+        .stderr(predicate::str::contains("noise").not());
+}
+
+#[test]
+fn xbps_query_output_is_never_shown() {
+    let sandbox = dwm_sandbox(&["btop"]);
+    sandbox.fake_tool("xbps-query", "echo query noise >&2; exit 2");
+    sandbox.fake_tool("xbps-install", "true");
+    sandbox.fake_sudo();
+
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("query noise").not())
+        .stderr(predicate::str::contains("query noise").not());
+}
+
+#[test]
+fn with_json_the_install_output_goes_to_stderr_and_stdout_stays_one_document() {
+    let sandbox = dwm_sandbox(&["btop"]);
+    sandbox.fake_tool("xbps-query", "exit 2");
+    sandbox.fake_tool("xbps-install", "echo '[*] Downloading btop'");
+    sandbox.fake_sudo();
+
+    let output = sandbox
+        .command()
+        .args(["--json", "link", "dwm", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report.get("install").is_some());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("[*] Downloading btop"), "{stderr}");
 }
 
 #[test]

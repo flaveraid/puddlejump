@@ -8,11 +8,11 @@ use thiserror::Error;
 
 use crate::adopt::{apply_adopt, moved_links, AdoptOutcome, AdoptPlan, AdoptResult};
 use crate::apply::{apply_files, refuse_conflicts, ApplyError, PackageOutcome, RealFileWriter};
-use crate::hook::{run_hooks, HookObserver, HookOutcome};
+use crate::hook::{run_hooks, HookObserver, HookOutcome, HookOutputStream};
 use crate::link::FileSystemState;
 use crate::package::PackageName;
 use crate::plan::{ConflictKind, PackageActions, Plan, RelinkPlan, RootReason};
-use crate::system::command::CommandRunner;
+use crate::system::command::{CommandRunner, Stream};
 use crate::system::privilege::Privilege;
 use crate::system::privileged_writer::PrivilegedFileWriter;
 use crate::system::PackageManager;
@@ -243,7 +243,7 @@ pub fn execute_link(
     let reasons = effective_root_reasons(plan, options);
     refuse_if_root_unavailable(&reasons, options.privilege)?;
     let files = apply_packages(&plan.packages, &reasons, options.privilege, state, runner)?;
-    let install = install_packages(plan, options, manager);
+    let install = install_packages(plan, options, manager, observer);
     let install_failed = matches!(install, InstallOutcome::Failed { .. });
     let hooks = if options.hooks && !install_failed {
         run_hooks(&plan.hooks, observer)
@@ -347,10 +347,13 @@ pub fn execute_relink(
     Ok(outcomes)
 }
 
+/// Installs the system packages the plan needs, showing the installer's output
+/// through `observer` as it runs.
 fn install_packages(
     plan: &Plan,
     options: &ExecuteOptions,
     manager: Option<&dyn PackageManager>,
+    observer: &mut dyn HookObserver,
 ) -> InstallOutcome {
     let packages = &plan.system.to_install;
     if packages.is_empty() {
@@ -364,7 +367,14 @@ fn install_packages(
     let Some(manager) = manager else {
         return InstallOutcome::NoManager;
     };
-    match manager.install(packages) {
+    let mut show = |stream: Stream, line: &str| {
+        let stream = match stream {
+            Stream::Stdout => HookOutputStream::Stdout,
+            Stream::Stderr => HookOutputStream::Stderr,
+        };
+        observer.install_output(stream, line);
+    };
+    match manager.install(packages, &mut show) {
         Ok(()) => InstallOutcome::Installed {
             packages: packages.clone(),
         },
@@ -400,12 +410,15 @@ mod tests {
     struct FakeManager {
         installs: RefCell<Vec<Vec<String>>>,
         fail_with: Option<&'static str>,
+        /// What the installer "writes" while it runs.
+        output: Vec<(Stream, &'static str)>,
     }
 
     fn manager() -> FakeManager {
         FakeManager {
             installs: RefCell::new(Vec::new()),
             fail_with: None,
+            output: Vec::new(),
         }
     }
 
@@ -418,8 +431,15 @@ mod tests {
             Ok(false)
         }
 
-        fn install(&self, packages: &[String]) -> Result<(), SystemError> {
+        fn install(
+            &self,
+            packages: &[String],
+            on_line: crate::system::command::LineCallback,
+        ) -> Result<(), SystemError> {
             self.installs.borrow_mut().push(packages.to_vec());
+            for (stream, line) in &self.output {
+                on_line(*stream, line);
+            }
             match self.fail_with {
                 Some(reason) => Err(SystemError::Install {
                     packages: packages.to_vec(),
@@ -786,6 +806,111 @@ mod tests {
         );
         assert_eq!(*manager.installs.borrow(), [strings(&["base-devel", "fd"])]);
         assert!(link.is_symlink());
+    }
+
+    /// Records what the observer is told, in order.
+    #[derive(Default)]
+    struct Recorder {
+        events: Vec<String>,
+    }
+
+    impl HookObserver for Recorder {
+        fn started(&mut self, hook: &HookPlan) {
+            self.events.push(format!("hook {}", hook.package));
+        }
+
+        fn output(&mut self, _: &HookPlan, _: HookOutputStream, line: &str) {
+            self.events.push(format!("hook output {line}"));
+        }
+
+        fn install_output(&mut self, stream: HookOutputStream, line: &str) {
+            self.events.push(format!("install {stream:?} {line}"));
+        }
+    }
+
+    #[test]
+    fn the_installers_output_reaches_the_observer_before_any_hook_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("log");
+        let manager = FakeManager {
+            output: vec![
+                (Stream::Stdout, "[*] Downloading btop"),
+                (Stream::Stderr, "warning: slow mirror"),
+            ],
+            ..manager()
+        };
+        let plan = plan(
+            vec![],
+            system_plan(&["btop"]),
+            vec![logging_hook(root.path(), "btop", &log, 0)],
+            vec![],
+        );
+        let mut recorder = Recorder::default();
+
+        execute_link(
+            &plan,
+            &options(Some(Privilege::UseSudo)),
+            &RealFileSystem,
+            &FakeCommandRunner::new(),
+            Some(&manager),
+            &mut recorder,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorder.events,
+            [
+                "install Stdout [*] Downloading btop",
+                "install Stderr warning: slow mirror",
+                "hook btop",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_installs_output_is_shown_and_the_failure_is_still_reported() {
+        let manager = FakeManager {
+            fail_with: Some("no space"),
+            output: vec![(Stream::Stderr, "no space")],
+            ..manager()
+        };
+        let plan = plan(vec![], system_plan(&["git"]), vec![], vec![]);
+        let mut recorder = Recorder::default();
+
+        let report = execute_link(
+            &plan,
+            &options(Some(Privilege::UseSudo)),
+            &RealFileSystem,
+            &FakeCommandRunner::new(),
+            Some(&manager),
+            &mut recorder,
+        )
+        .unwrap();
+
+        assert_eq!(recorder.events, ["install Stderr no space"]);
+        assert!(matches!(report.install, InstallOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn nothing_to_install_shows_no_installer_output() {
+        let manager = FakeManager {
+            output: vec![(Stream::Stdout, "should never appear")],
+            ..manager()
+        };
+        let plan = plan(vec![], system_plan(&[]), vec![], vec![]);
+        let mut recorder = Recorder::default();
+
+        execute_link(
+            &plan,
+            &options(None),
+            &RealFileSystem,
+            &FakeCommandRunner::new(),
+            Some(&manager),
+            &mut recorder,
+        )
+        .unwrap();
+
+        assert!(recorder.events.is_empty());
     }
 
     #[test]

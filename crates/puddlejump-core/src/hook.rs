@@ -31,6 +31,13 @@ pub trait HookObserver {
 
     /// The running hook wrote a line, without its trailing newline.
     fn output(&mut self, hook: &HookPlan, stream: HookOutputStream, line: &str);
+
+    /// The system package installer wrote a line, without its trailing
+    /// newline. Called while the install runs, before any hook starts.
+    ///
+    /// Does nothing by default, so an observer that only cares about hooks
+    /// needs no change.
+    fn install_output(&mut self, _stream: HookOutputStream, _line: &str) {}
 }
 
 /// An observer that ignores everything, for callers that only want the report.

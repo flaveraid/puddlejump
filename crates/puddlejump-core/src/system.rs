@@ -158,10 +158,15 @@ pub trait PackageManager {
     /// installed is `Ok(false)`, not an error.
     fn is_installed(&self, package: &str) -> Result<bool, SystemError>;
 
-    /// Installs all of `packages` in a single call.
+    /// Installs all of `packages` in a single call, handing each line the
+    /// installer writes to `on_line` while it runs.
     ///
     /// Errors if the installation fails.
-    fn install(&self, packages: &[String]) -> Result<(), SystemError>;
+    fn install(
+        &self,
+        packages: &[String],
+        on_line: command::LineCallback,
+    ) -> Result<(), SystemError>;
 }
 
 /// What to do about the system packages that packages declare.
@@ -296,7 +301,11 @@ mod tests {
             Ok(self.installed.contains(package))
         }
 
-        fn install(&self, _packages: &[String]) -> Result<(), SystemError> {
+        fn install(
+            &self,
+            _packages: &[String],
+            _on_line: command::LineCallback,
+        ) -> Result<(), SystemError> {
             Ok(())
         }
     }
@@ -559,6 +568,15 @@ mod tests {
             ) -> std::io::Result<command::CommandOutput> {
                 self.0.run(program, args)
             }
+
+            fn run_streaming(
+                &self,
+                program: &str,
+                args: &[String],
+                on_line: command::LineCallback,
+            ) -> std::io::Result<command::CommandOutput> {
+                self.0.run_streaming(program, args, on_line)
+            }
         }
         let runner = Rc::new(command::fake::FakeCommandRunner::new());
         let manager = build_manager(
@@ -567,9 +585,12 @@ mod tests {
             privilege::Privilege::UseSudo,
         );
 
-        manager.install(&["git".to_string()]).unwrap();
+        manager
+            .install(&["git".to_string()], &mut |_, _| {})
+            .unwrap();
 
         assert_eq!(runner.lines(), ["sudo xbps-install -y git"]);
+        assert_eq!(runner.streamed(), [true], "the install streams its output");
     }
 
     #[test]
