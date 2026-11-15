@@ -31,6 +31,15 @@ pub fn repo_from_environment() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The `XDG_CONFIG_HOME` directory, if set and not empty.
+///
+/// Whether it is usable (absolute) is decided by core, which owns the rule.
+pub fn xdg_config_home_from_environment() -> Option<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The host named by `PUDDLEJUMP_HOST`, if set, not empty, and valid UTF-8.
 pub fn host_from_environment() -> Option<String> {
     env::var(HOST_VARIABLE)

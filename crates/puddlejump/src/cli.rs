@@ -8,7 +8,8 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(version, about)]
 pub struct Cli {
-    /// The dotfiles repo (default: $PUDDLEJUMP_REPO, else the current directory).
+    /// The dotfiles repo (default: $PUDDLEJUMP_REPO, else `repo` in the user
+    /// config, else the current directory).
     #[arg(long, global = true, value_name = "DIR")]
     pub repo: Option<PathBuf>,
 
@@ -16,7 +17,8 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     pub target: Option<PathBuf>,
 
-    /// The host profile to use (default: $PUDDLEJUMP_HOST, else the hostname).
+    /// The host profile to use (default: $PUDDLEJUMP_HOST, else `host` in the
+    /// user config, else the hostname).
     #[arg(long, global = true, value_name = "NAME")]
     pub host: Option<String>,
 

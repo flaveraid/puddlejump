@@ -90,6 +90,11 @@ impl Sandbox {
         write(&self.home().join(relative), contents)
     }
 
+    /// Writes the user config at its default place under the home directory.
+    pub fn user_config(&self, contents: &str) -> PathBuf {
+        self.home_file(".config/puddlejump/config.toml", contents)
+    }
+
     /// Installs fake `xbps-query`, `xbps-install`, and `sudo`.
     ///
     /// `installed` lists the packages `xbps-query` reports as installed; any

@@ -87,11 +87,37 @@ package_manager = "xbps"    # optional; overrides auto-detection
 packages = ["zsh", "nvim", "dwm"]   # roots only; dependencies come along
 ```
 
-- Host selection: `--host`, else `$PUDDLEJUMP_HOST`, else the machine hostname,
-  if a matching profile exists. Profiles are optional.
+- Host selection: `--host`, else `$PUDDLEJUMP_HOST`, else `host` in the user
+  config, else the machine hostname, if a matching profile exists. A host named
+  by flag, environment, or user config must have a profile; the hostname is
+  only a guess. Profiles are optional.
 - `link` with no package arguments and no profile lists every package in the
   repo (calling out root-requiring ones) and asks for confirmation. `--yes`
   skips the prompt. No profile includes/inheritance in v1.
+
+## User config
+
+The repo config above lives inside the repo, so it cannot say where the repo
+is. The user's own settings live in `$XDG_CONFIG_HOME/puddlejump/config.toml`,
+or `~/.config/puddlejump/config.toml` when `XDG_CONFIG_HOME` is unset, empty, or
+not absolute (the XDG rule is to ignore a relative value).
+
+```toml
+# ~/.config/puddlejump/config.toml
+repo = "~/dotfiles"    # optional; absolute, or starting with ~/
+host = "lenovo"        # optional; a profile name
+```
+
+- Repo: `--repo`, else `$PUDDLEJUMP_REPO`, else `repo`, else the current
+  directory. A relative `repo` is an error, since it would mean a different
+  place depending on where the command is run.
+- Host: see above; `host` sits between the environment and the hostname.
+- A missing file is the defaults. An unreadable file, bad TOML, or an unknown
+  key is an error that names the file. `init` ignores the file, like it ignores
+  `--repo`, so a broken config cannot stop a new repo being created.
+- Only `repo` and `host` are accepted. The file is read by `core`
+  (`user_config`) from paths the CLI passes in; `core` never reads the
+  environment.
 
 ## Root handling (model B)
 
@@ -136,7 +162,8 @@ Hooks are expected to be idempotent.
 
 ## CLI
 
-Global flags: `--repo <dir>` (default `$PUDDLEJUMP_REPO`, else cwd),
+Global flags: `--repo <dir>` (default `$PUDDLEJUMP_REPO`, else the user
+config's `repo`, else cwd),
 `--target <dir>` (replaces all package targets; for staging/tests),
 `--host <name>`, `--json`.
 
@@ -231,6 +258,7 @@ config.rs      repo config
 manifest.rs    Manifest, parsing/validation
 package.rs     PackageName, Package, Repo; discovery; file enumeration
 host.rs        host profiles and selection
+user_config.rs the user's own config file: repo and host
 session.rs     open a repo from raw inputs; choose which packages
 graph.rs       DependencyGraph: cycles, missing packages, link order
 system.rs      PackageManager trait, ManagerId, detection

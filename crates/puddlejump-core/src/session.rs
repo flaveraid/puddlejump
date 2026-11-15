@@ -18,6 +18,8 @@ pub struct SessionInputs<'a> {
     pub repo_flag: Option<&'a Path>,
     /// The `PUDDLEJUMP_REPO` environment variable.
     pub repo_environment: Option<&'a Path>,
+    /// The `repo` key of the user config.
+    pub repo_config: Option<&'a Path>,
     /// The current directory, used when no repo is given.
     pub current_dir: &'a Path,
     /// What `~` means in a manifest target.
@@ -28,6 +30,8 @@ pub struct SessionInputs<'a> {
     pub host_flag: Option<&'a str>,
     /// The `PUDDLEJUMP_HOST` environment variable.
     pub host_environment: Option<&'a str>,
+    /// The `host` key of the user config.
+    pub host_config: Option<&'a str>,
     /// The machine's hostname, if known.
     pub hostname: Option<&'a str>,
 }
@@ -92,8 +96,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// Opens the repo from `--repo`, else `PUDDLEJUMP_REPO`, else the current
-    /// directory, and reads its packages, config, and host selection.
+    /// Opens the repo from `--repo`, else `PUDDLEJUMP_REPO`, else the user
+    /// config's `repo`, else the current directory, and reads its packages,
+    /// config, and host selection.
     ///
     /// Errors if the packages or config cannot be read, or a host named by
     /// flag or environment has no profile.
@@ -101,6 +106,7 @@ impl Session {
         let root = inputs
             .repo_flag
             .or(inputs.repo_environment)
+            .or(inputs.repo_config)
             .unwrap_or(inputs.current_dir);
         let repo = Repo::discover(root)?;
         let config = RepoConfig::load(root)?;
@@ -108,6 +114,7 @@ impl Session {
         let host = select_host(
             inputs.host_flag,
             inputs.host_environment,
+            inputs.host_config,
             inputs.hostname,
             &available_hosts,
             root,
@@ -207,9 +214,11 @@ mod tests {
     struct Inputs {
         repo_flag: Option<PathBuf>,
         repo_environment: Option<PathBuf>,
+        repo_config: Option<PathBuf>,
         current_dir: PathBuf,
         host_flag: Option<String>,
         host_environment: Option<String>,
+        host_config: Option<String>,
         hostname: Option<String>,
         target_override: Option<PathBuf>,
     }
@@ -218,9 +227,11 @@ mod tests {
         Inputs {
             repo_flag: None,
             repo_environment: None,
+            repo_config: None,
             current_dir: current_dir.to_path_buf(),
             host_flag: None,
             host_environment: None,
+            host_config: None,
             hostname: None,
             target_override: None,
         }
@@ -230,11 +241,13 @@ mod tests {
         Session::open(&SessionInputs {
             repo_flag: inputs.repo_flag.as_deref(),
             repo_environment: inputs.repo_environment.as_deref(),
+            repo_config: inputs.repo_config.as_deref(),
             current_dir: &inputs.current_dir,
             home: Path::new("/home/me"),
             target_override: inputs.target_override.as_deref(),
             host_flag: inputs.host_flag.as_deref(),
             host_environment: inputs.host_environment.as_deref(),
+            host_config: inputs.host_config.as_deref(),
             hostname: inputs.hostname.as_deref(),
         })
     }
@@ -259,6 +272,46 @@ mod tests {
         let session = open(&given).unwrap();
 
         assert!(session.repo.packages.contains_key(&name("from-env")));
+    }
+
+    #[test]
+    fn the_config_repo_beats_the_current_directory() {
+        let cwd = repo_with(&["from-cwd"]);
+        let config = repo_with(&["from-config"]);
+        let mut given = inputs(cwd.path());
+        given.repo_config = Some(config.path().to_path_buf());
+
+        let session = open(&given).unwrap();
+
+        assert!(session.repo.packages.contains_key(&name("from-config")));
+    }
+
+    #[test]
+    fn the_environment_repo_beats_the_config_repo() {
+        let cwd = repo_with(&["from-cwd"]);
+        let env = repo_with(&["from-env"]);
+        let config = repo_with(&["from-config"]);
+        let mut given = inputs(cwd.path());
+        given.repo_environment = Some(env.path().to_path_buf());
+        given.repo_config = Some(config.path().to_path_buf());
+
+        let session = open(&given).unwrap();
+
+        assert!(session.repo.packages.contains_key(&name("from-env")));
+    }
+
+    #[test]
+    fn the_repo_flag_beats_the_config_repo() {
+        let cwd = repo_with(&["from-cwd"]);
+        let flag = repo_with(&["from-flag"]);
+        let config = repo_with(&["from-config"]);
+        let mut given = inputs(cwd.path());
+        given.repo_flag = Some(flag.path().to_path_buf());
+        given.repo_config = Some(config.path().to_path_buf());
+
+        let session = open(&given).unwrap();
+
+        assert!(session.repo.packages.contains_key(&name("from-flag")));
     }
 
     #[test]
@@ -319,6 +372,45 @@ mod tests {
 
         assert_eq!(session.host.unwrap().name.as_str(), "lenovo");
         assert_eq!(session.available_hosts.len(), 1);
+    }
+
+    #[test]
+    fn the_config_host_beats_the_hostname() {
+        let root = repo_with(&["zsh"]);
+        write_host(root.path(), "lenovo", &["zsh"]);
+        write_host(root.path(), "desktop", &["zsh"]);
+        let mut given = inputs(root.path());
+        given.host_config = Some("desktop".to_string());
+        given.hostname = Some("lenovo".to_string());
+
+        let session = open(&given).unwrap();
+
+        assert_eq!(session.host.unwrap().name.as_str(), "desktop");
+    }
+
+    #[test]
+    fn the_host_environment_beats_the_config_host() {
+        let root = repo_with(&["zsh"]);
+        write_host(root.path(), "lenovo", &["zsh"]);
+        write_host(root.path(), "desktop", &["zsh"]);
+        let mut given = inputs(root.path());
+        given.host_environment = Some("lenovo".to_string());
+        given.host_config = Some("desktop".to_string());
+
+        let session = open(&given).unwrap();
+
+        assert_eq!(session.host.unwrap().name.as_str(), "lenovo");
+    }
+
+    #[test]
+    fn a_config_host_naming_a_missing_profile_is_an_error() {
+        let root = repo_with(&["zsh"]);
+        let mut given = inputs(root.path());
+        given.host_config = Some("ghost".to_string());
+
+        let error = open(&given).unwrap_err();
+
+        assert!(matches!(error, SessionError::Host(_)));
     }
 
     #[test]

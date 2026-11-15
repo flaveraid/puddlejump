@@ -49,7 +49,18 @@ Only xbps (Void Linux) is supported. If no package manager is found, linking sti
 packages = ["zsh", "dwm"]
 ```
 
-The host is chosen by `--host`, then `$PUDDLEJUMP_HOST`, then the machine's hostname.
+The host is chosen by `--host`, then `$PUDDLEJUMP_HOST`, then `host` in your user config, then the machine's hostname.
+
+## User config
+
+To avoid passing `--repo` and `--host` every time, set them in `~/.config/puddlejump/config.toml` (or `$XDG_CONFIG_HOME/puddlejump/config.toml`). Both keys are optional.
+
+```toml
+repo = "~/dotfiles"     # absolute, or starting with ~/
+host = "laptop"         # a profile in hosts/
+```
+
+The repo is chosen by `--repo`, then `$PUDDLEJUMP_REPO`, then `repo` here, then the current directory.
 
 ## Usage
 
@@ -69,6 +80,7 @@ puddlejump init <path>            # create a new dotfiles repo at <path>
 With no packages named, `link` uses the host profile, or asks before linking everything.
 
 Flags: `-n/--dry-run` (everything that changes files), `-y/--yes`, `--no-install`, `--no-hooks`, `--prune` (unlink, relink), `--target <dir>`, `--json`.
+
 
 Existing files are never overwritten. Conflicts are reported and nothing is changed; use `adopt` to take over a file.
 

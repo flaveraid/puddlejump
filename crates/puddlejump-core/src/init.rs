@@ -618,7 +618,8 @@ mod tests {
 
         let available = crate::host::available_hosts(&root).unwrap();
         let chosen =
-            crate::host::select_host(None, None, Some("my laptop"), &available, &root).unwrap();
+            crate::host::select_host(None, None, None, Some("my laptop"), &available, &root)
+                .unwrap();
 
         assert_eq!(chosen.unwrap().name.as_str(), "my-laptop");
     }
@@ -631,7 +632,8 @@ mod tests {
 
         let available = crate::host::available_hosts(&root).unwrap();
         let chosen =
-            crate::host::select_host(None, None, Some("lenovo.local"), &available, &root).unwrap();
+            crate::host::select_host(None, None, None, Some("lenovo.local"), &available, &root)
+                .unwrap();
 
         assert_eq!(host_profiles(&root), ["lenovo.local.toml"]);
         assert_eq!(chosen.unwrap().name.as_str(), "lenovo.local");

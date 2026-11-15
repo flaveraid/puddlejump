@@ -25,6 +25,7 @@ use puddlejump_core::status::package_statuses;
 use puddlejump_core::system::command::SystemCommandRunner;
 use puddlejump_core::system::privilege::Privilege;
 use puddlejump_core::system::{build_manager, detect, ManagerId, PackageManager};
+use puddlejump_core::user_config::{user_config_path, UserConfig};
 
 use crate::cli::{AdoptArgs, Cli, Command, HookArgs, InitArgs, LinkArgs, StatusArgs, UnlinkArgs};
 use crate::{environment, prompt, render};
@@ -143,6 +144,9 @@ pub struct Environment {
     pub repo: Option<PathBuf>,
     /// The `PUDDLEJUMP_HOST` value.
     pub host: Option<String>,
+    /// The `XDG_CONFIG_HOME` value, which says where the user config is.
+    pub xdg_config_home: Option<PathBuf>,
+
     /// The machine's hostname.
     pub hostname: Option<String>,
     /// The `PATH` value, for finding `sudo` and the package manager.
@@ -162,6 +166,8 @@ impl Environment {
             home: environment::home_directory()?,
             repo: environment::repo_from_environment(),
             host: environment::host_from_environment(),
+            xdg_config_home: environment::xdg_config_home_from_environment(),
+
             hostname: puddlejump_core::host::machine_hostname(),
             path: std::env::var_os("PATH"),
             is_root: environment::running_as_root(),
@@ -199,14 +205,18 @@ pub fn run(cli: &Cli, environment: &Environment, terminal: &mut Terminal) -> Res
 }
 
 fn open_session(cli: &Cli, environment: &Environment) -> Result<Session> {
+    let config_path = user_config_path(environment.xdg_config_home.as_deref(), &environment.home);
+    let user_config = UserConfig::load(&config_path, &environment.home)?;
     Session::open(&SessionInputs {
         repo_flag: cli.repo.as_deref(),
         repo_environment: environment.repo.as_deref(),
+        repo_config: user_config.repo.as_deref(),
         current_dir: &environment.current_dir,
         home: &environment.home,
         target_override: cli.target.as_deref(),
         host_flag: cli.host.as_deref(),
         host_environment: environment.host.as_deref(),
+        host_config: user_config.host.as_deref(),
         hostname: environment.hostname.as_deref(),
     })
     .context("cannot open the repo")

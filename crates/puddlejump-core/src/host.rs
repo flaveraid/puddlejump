@@ -188,6 +188,8 @@ pub enum HostSource {
     Flag,
     /// The `PUDDLEJUMP_HOST` environment variable.
     Environment,
+    /// The `host` key of the user config.
+    UserConfig,
     /// The machine's hostname.
     Hostname,
 }
@@ -203,23 +205,26 @@ pub struct SelectedHost {
 
 /// Decides which host profile to use, if any.
 ///
-/// In order: the `flag`, then the `environment` value, then the machine's
-/// `hostname`. A host named explicitly (flag or environment) must have a
-/// profile in `available`, otherwise that is an error. The hostname is only a
-/// guess, so it is used only if a profile with that name exists; with no
-/// match there is simply no profile, which is allowed.
+/// In order: the `flag`, then the `environment` value, then the user
+/// `config` value, then the machine's `hostname`. A host named explicitly
+/// (flag, environment, or config) must have a profile in `available`,
+/// otherwise that is an error. The hostname is only a guess, so it is used
+/// only if a profile with that name exists; with no match there is simply no
+/// profile, which is allowed.
 ///
 /// Errors if an explicit name is invalid or has no profile.
 pub fn select_host(
     flag: Option<&str>,
     environment: Option<&str>,
+    config: Option<&str>,
     hostname: Option<&str>,
     available: &[HostName],
     repo_root: &Path,
 ) -> Result<Option<SelectedHost>, HostError> {
     let explicit = flag
         .map(|name| (name, HostSource::Flag))
-        .or(environment.map(|name| (name, HostSource::Environment)));
+        .or(environment.map(|name| (name, HostSource::Environment)))
+        .or(config.map(|name| (name, HostSource::UserConfig)));
     if let Some((name, source)) = explicit {
         let name = HostName::new(name)?;
         if !available.contains(&name) {
@@ -315,8 +320,25 @@ mod tests {
         hostname: Option<&str>,
         available: &[&str],
     ) -> Result<Option<SelectedHost>, HostError> {
+        select_with_config(flag, environment, None, hostname, available)
+    }
+
+    fn select_with_config(
+        flag: Option<&str>,
+        environment: Option<&str>,
+        config: Option<&str>,
+        hostname: Option<&str>,
+        available: &[&str],
+    ) -> Result<Option<SelectedHost>, HostError> {
         let available: Vec<HostName> = available.iter().map(|name| host(name)).collect();
-        select_host(flag, environment, hostname, &available, Path::new("/repo"))
+        select_host(
+            flag,
+            environment,
+            config,
+            hostname,
+            &available,
+            Path::new("/repo"),
+        )
     }
 
     fn selected(name: &str, source: HostSource) -> Option<SelectedHost> {
@@ -437,6 +459,63 @@ mod tests {
         let chosen = select(None, Some("laptop"), Some("server"), &["laptop", "server"]).unwrap();
 
         assert_eq!(chosen, selected("laptop", HostSource::Environment));
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_user_config() {
+        let chosen = select_with_config(
+            None,
+            Some("laptop"),
+            Some("desktop"),
+            None,
+            &["laptop", "desktop"],
+        )
+        .unwrap();
+
+        assert_eq!(chosen, selected("laptop", HostSource::Environment));
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_user_config() {
+        let chosen = select_with_config(
+            Some("laptop"),
+            None,
+            Some("desktop"),
+            None,
+            &["laptop", "desktop"],
+        )
+        .unwrap();
+
+        assert_eq!(chosen, selected("laptop", HostSource::Flag));
+    }
+
+    #[test]
+    fn the_user_config_wins_over_the_hostname() {
+        let chosen = select_with_config(
+            None,
+            None,
+            Some("desktop"),
+            Some("laptop"),
+            &["laptop", "desktop"],
+        )
+        .unwrap();
+
+        assert_eq!(chosen, selected("desktop", HostSource::UserConfig));
+    }
+
+    #[test]
+    fn a_user_config_host_without_a_profile_is_an_error() {
+        let error =
+            select_with_config(None, None, Some("ghost"), Some("laptop"), &["laptop"]).unwrap_err();
+
+        assert!(matches!(error, HostError::NotFound { .. }));
+    }
+
+    #[test]
+    fn an_invalid_user_config_host_is_an_error() {
+        let error = select_with_config(None, None, Some("a/b"), None, &[]).unwrap_err();
+
+        assert!(matches!(error, HostError::InvalidName(_)));
     }
 
     #[test]

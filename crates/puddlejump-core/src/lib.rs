@@ -18,6 +18,7 @@ pub mod plan;
 pub mod session;
 pub mod status;
 pub mod system;
+pub mod user_config;
 
 #[cfg(test)]
 mod test_scripts;
