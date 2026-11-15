@@ -122,7 +122,12 @@ host = "lenovo"        # optional; a profile name
 ## Root handling (model B)
 
 puddlejump runs as the invoking user. It shells out to `sudo` only for system
-package installs and for links into root-owned targets. Hooks run as the user.
+package installs and for links into root-owned targets. Hooks run as the user,
+always: `needs_root` covers linking and system installs, never the hook. A hook
+that needs root for some command calls `sudo` itself for that command, so what
+runs privileged is visible in the script and the hook keeps the user's `$HOME`
+and file ownership. Hook stdin is closed, but `sudo` reads its password prompt
+from the terminal directly, so a `sudo` call in a hook can still ask for one.
 
 It refuses to run *under* `sudo`: if the process is root and `$SUDO_USER` is
 set, every command exits 2 before doing anything. Under `sudo` the home
