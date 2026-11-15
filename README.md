@@ -81,6 +81,7 @@ With no packages named, `link` uses the host profile, or asks before linking eve
 
 Flags: `-n/--dry-run` (everything that changes files), `-y/--yes`, `--no-install`, `--no-hooks`, `--prune` (unlink, relink), `--target <dir>`, `--json`.
 
+Run puddlejump as your own user, not with `sudo`; it refuses to run under `sudo` and uses `sudo` itself when a package needs root.
 
 Existing files are never overwritten. Conflicts are reported and nothing is changed; use `adopt` to take over a file.
 

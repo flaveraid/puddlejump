@@ -40,6 +40,30 @@ pub fn xdg_config_home_from_environment() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The user `sudo` was run by, if set and not empty.
+pub fn sudo_user_from_environment() -> Option<String> {
+    env::var("SUDO_USER").ok().filter(|value| !value.is_empty())
+}
+
+/// Refuses to run as root through `sudo`.
+///
+/// A root login is fine: its home and config are root's own. Under `sudo`,
+/// the home directory, the config, and file ownership are all muddled between
+/// the two users, and puddlejump already uses `sudo` itself for the few things
+/// that need root. `sudo_user` is `SUDO_USER`; a process that is not root is
+/// never refused, since a stray `SUDO_USER` is harmless there.
+///
+/// Errors if `is_root` and `sudo_user` is set.
+pub fn refuse_sudo(is_root: bool, sudo_user: Option<&str>) -> Result<()> {
+    match (is_root, sudo_user) {
+        (true, Some(user)) => Err(anyhow!(
+            "puddlejump must not be run with sudo (invoked by {user}); it uses sudo itself \
+             when a package needs root. Run it as your own user"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The host named by `PUDDLEJUMP_HOST`, if set, not empty, and valid UTF-8.
 pub fn host_from_environment() -> Option<String> {
     env::var(HOST_VARIABLE)
@@ -137,6 +161,29 @@ mod tests {
     #[test]
     fn an_empty_path_finds_nothing() {
         assert!(!is_on_path("sudo", Some(OsStr::new(""))));
+    }
+
+    #[test]
+    fn root_under_sudo_is_refused_naming_the_invoking_user() {
+        let error = refuse_sudo(true, Some("jeff")).unwrap_err();
+
+        assert!(error.to_string().contains("must not be run with sudo"));
+        assert!(error.to_string().contains("jeff"));
+    }
+
+    #[test]
+    fn a_root_login_is_allowed() {
+        assert!(refuse_sudo(true, None).is_ok());
+    }
+
+    #[test]
+    fn a_normal_user_is_allowed_even_with_a_stray_sudo_user() {
+        assert!(refuse_sudo(false, Some("jeff")).is_ok());
+    }
+
+    #[test]
+    fn a_normal_user_without_sudo_is_allowed() {
+        assert!(refuse_sudo(false, None).is_ok());
     }
 
     #[test]

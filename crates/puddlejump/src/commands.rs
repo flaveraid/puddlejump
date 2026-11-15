@@ -146,7 +146,8 @@ pub struct Environment {
     pub host: Option<String>,
     /// The `XDG_CONFIG_HOME` value, which says where the user config is.
     pub xdg_config_home: Option<PathBuf>,
-
+    /// The `SUDO_USER` value, set when run through `sudo`.
+    pub sudo_user: Option<String>,
     /// The machine's hostname.
     pub hostname: Option<String>,
     /// The `PATH` value, for finding `sudo` and the package manager.
@@ -167,7 +168,7 @@ impl Environment {
             repo: environment::repo_from_environment(),
             host: environment::host_from_environment(),
             xdg_config_home: environment::xdg_config_home_from_environment(),
-
+            sudo_user: environment::sudo_user_from_environment(),
             hostname: puddlejump_core::host::machine_hostname(),
             path: std::env::var_os("PATH"),
             is_root: environment::running_as_root(),
@@ -188,6 +189,7 @@ impl Environment {
 /// Errors only for problems that are not a refusal or a failure of the work
 /// itself, such as an unreadable repo or a broken terminal.
 pub fn run(cli: &Cli, environment: &Environment, terminal: &mut Terminal) -> Result<Outcome> {
+    environment::refuse_sudo(environment.is_root, environment.sudo_user.as_deref())?;
     let json = cli.json;
     // Only `init` runs without an existing repo, so it must not open one. Every
     // other command opens the session lazily, here, once.

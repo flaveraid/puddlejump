@@ -124,6 +124,13 @@ host = "lenovo"        # optional; a profile name
 puddlejump runs as the invoking user. It shells out to `sudo` only for system
 package installs and for links into root-owned targets. Hooks run as the user.
 
+It refuses to run *under* `sudo`: if the process is root and `$SUDO_USER` is
+set, every command exits 2 before doing anything. Under `sudo` the home
+directory, the user config, and file ownership are muddled between two users,
+and puddlejump already uses `sudo` itself where root is needed. A real root
+login is allowed, since its home and config are root's own. The check relies on
+`SUDO_USER`, so tools that do not set it (`doas`, `su`) are not detected.
+
 A package needs root if `needs_root = true` OR its target is not writable by
 the current user. System installs also need root. If the manifest says
 `false`/omits it but inference says root is needed, the plan carries a warning
