@@ -1,7 +1,8 @@
 # puddlejump design (v1)
 
-Decided design for v1. `CLAUDE.md` holds the standing rules (architecture,
-coding standards, testing); this file records what we are building.
+The design of puddlejump v1. `CLAUDE.md` holds the standing project rules
+(architecture, coding standards, testing); this file describes what puddlejump
+does and how it is built.
 
 ## Concept
 
@@ -39,8 +40,9 @@ dotfiles/
   followed and treated as a package (a broken one is an error). Nothing
   inside a package is ever followed. A symlink inside a package is linked by
   **copying the symlink**: the target gets a new symlink with the same
-  destination (a single hop, not a link to the package's link). How relative
-  destinations are handled is decided in the planning step.
+  destination (a single hop, not a link to the package's link). A symlink with
+  a relative destination is skipped with a warning, because the same relative
+  path would resolve to something different from the target directory.
 - Linking is **per file**. Parent directories are real directories. Directory
   symlinks are never created (no Stow-style folding/unfolding), so packages
   cannot interfere with each other and apps writing into a directory write to
@@ -168,9 +170,26 @@ live through a `HookObserver` callback (core never prints) and also collected
 in the report. Output is piped, not a TTY, so tools may switch to plain
 output; a PTY is a post-v1 follow-up. There is no timeout in v1.
 
-`link` runs hooks every time it runs. When nothing was newly linked and a hook
-is about to run (the "running it again" case), it prompts first; `--yes` skips.
-Hooks are expected to be idempotent.
+The install step is shown the same way. `xbps-install`'s output is streamed
+through the same observer (`install_output`) while it runs, prefixed
+`[install]`, and is complete before any hook starts. It follows the hook rule
+for `--json`: output goes to stderr, so stdout stays one document. Only the
+install is shown; the `xbps-query` checks stay silent. Because the installer
+writes to a pipe rather than a TTY, you get its log lines but not a live
+progress bar (the PTY follow-up covers both). Stdout and stderr are read on
+separate threads, so lines from the two streams can interleave out of order.
+A failure is shown live and also reported in the install result.
+
+`link` runs the hook of every package you name, every time it runs. When nothing
+was newly linked and a hook is about to run (the "running it again" case), it
+prompts first; `--yes` skips. Hooks are expected to be idempotent.
+
+A dependency you did not name is different: its hook is skipped when all of its
+files are already linked, because it did not change and you did not ask for it.
+A dependency that is partly linked, has a conflict, or has no files at all (a
+hook-only package, which can never be "already linked") still runs its hook.
+This is decided from file state alone; there is no record of whether a hook ever
+ran (see follow-up 2).
 
 ## CLI
 
@@ -343,21 +362,12 @@ pub trait PackageManager {
 | `assert_cmd` | dev, cli | run the real binary |
 | `predicates` | dev, cli | assert on output |
 
-Crates are added in the step that first uses them. Not used: `walkdir`,
-`which`, `nix`, `dialoguer`, `gethostname`.
+Not used: `walkdir`, `which`, `nix`, `dialoguer`, `gethostname`.
 
-## Build steps
+## Quality gates
 
-Each step ships with unit tests and must pass `cargo fmt --check`,
-`cargo clippy --all-targets -- -D warnings`, and `cargo test`; test output is
-shown at the end of each step.
-
-1. Workspace skeleton
-2. Manifests and package discovery
-3. Dependency resolution
-4. Planning
-5. Applying (links, installs, hooks)
-6. CLI
+Every change ships with tests and must pass `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, and `cargo test`.
 
 ## Test plan
 
@@ -417,7 +427,7 @@ fake `xbps-install`/`xbps-query`/`sudo` scripts first on `PATH`):
   profile selection; unknown host errors.
 - `hook` runs after confirmation, refuses a package without a hook.
 
-## Applying (step 5)
+## Applying
 
 - Applying refuses a plan containing any conflict, and a plan whose root
   requirements cannot be met (not root and no `sudo`), before touching
@@ -438,7 +448,10 @@ fake `xbps-install`/`xbps-query`/`sudo` scripts first on `PATH`):
 - Package managers run commands through a `CommandRunner` seam so tests assert
   exact argv. xbps: `xbps-query -p pkgver <name>` exits 0 when installed and 2
   when not (verified on xbps 0.60.7); any other exit is a query error.
-  Install is one `xbps-install -y <names...>` call.
+  Install is one `xbps-install -y <names...>` call, run through
+  `CommandRunner::run_streaming` so each output line reaches the caller as it
+  is written. Queries use plain `run`. A runner that cannot stream falls back
+  to replaying its buffered output.
 - Detection: the config override wins (error if its binary is not on `PATH`),
   else the first known manager found on `PATH`, else none. `PATH` is passed in.
 
@@ -472,3 +485,8 @@ Adding a package manager means a new backend module plus one arm in
    move that cannot leave a file half-moved.
 10. Bundle `state`, `runner`, and `privilege` into one type if a second
     frontend ends up constructing the `execute_*` arguments.
+11. Add shell completions (fish, zsh)
+12. `status` with no opts/args should list all packages and whether they're 
+    linked; additionally list env variables and their values.
+13. Consider adding a `copy` option that copies package to target instead of link
+
