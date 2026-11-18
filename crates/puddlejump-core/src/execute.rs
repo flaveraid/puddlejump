@@ -389,6 +389,7 @@ mod tests {
     use super::*;
     use crate::apply::{ActionResult, PackageOutcome};
     use crate::hook::{HookResult, SilentObserver};
+    use crate::hook_state::HookReason;
     use crate::link::RealFileSystem;
     use crate::plan::{Action, HookPlan, PackageActions};
     use crate::system::command::fake::FakeCommandRunner;
@@ -520,6 +521,7 @@ mod tests {
         let script = write_script(&package_dir, "hook.sh", &body, 0o755);
         HookPlan {
             package: name(package),
+            reason: HookReason::NeverRun,
             script,
             package_dir,
             target_dir: root.join("home"),

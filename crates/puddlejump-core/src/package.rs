@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::manifest::{Manifest, ManifestPathError, MANIFEST_FILE_NAME};
@@ -69,6 +69,15 @@ impl PackageName {
 impl fmt::Display for PackageName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+/// Goes through [`PackageName::new`], so a name read from a file is held to
+/// the same rules as one typed on the command line.
+impl<'de> Deserialize<'de> for PackageName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        PackageName::new(&text).map_err(serde::de::Error::custom)
     }
 }
 
@@ -273,6 +282,24 @@ mod tests {
         for name in ["zsh", "neo-vim", "sysctl_tweaks", "gcc12", "a.b"] {
             assert_eq!(PackageName::new(name).unwrap().as_str(), name);
         }
+    }
+
+    #[derive(Deserialize)]
+    struct Holder {
+        package: PackageName,
+    }
+
+    #[test]
+    fn package_name_deserializes_from_a_valid_string() {
+        let holder: Holder = toml::from_str("package = \"zsh\"").unwrap();
+
+        assert_eq!(holder.package.as_str(), "zsh");
+    }
+
+    #[test]
+    fn package_name_deserialization_rejects_an_invalid_name() {
+        assert!(toml::from_str::<Holder>("package = \"../etc\"").is_err());
+        assert!(toml::from_str::<Holder>("package = \"\"").is_err());
     }
 
     #[test]

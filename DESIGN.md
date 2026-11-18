@@ -1,6 +1,7 @@
-# puddlejump design (v1)
+# puddlejump design
 
-The design of puddlejump v1. `CLAUDE.md` holds the standing project rules
+The design of puddlejump (v1, plus the 0.2.0 persistent hook state described
+under Persistent state). `CLAUDE.md` holds the standing project rules
 (architecture, coding standards, testing); this file describes what puddlejump
 does and how it is built.
 
@@ -160,7 +161,8 @@ anything runs.
 A failed hook is reported; nothing is rolled back; later hooks still run;
 links stay in place. Success is the process exit status (0 = success). The
 report records exit status, stdout, and stderr. Hook scripts should use
-`set -e`. To retry, the user fixes the hook and runs `link` again.
+`set -e`. To retry, the user fixes the hook and runs `link` again: a hook that
+failed is retried automatically (see Persistent state).
 
 Hooks run with the package directory as the working directory, as the
 invoking user (never through sudo), with `PUDDLEJUMP_PACKAGE`,
@@ -180,16 +182,64 @@ progress bar (the PTY follow-up covers both). Stdout and stderr are read on
 separate threads, so lines from the two streams can interleave out of order.
 A failure is shown live and also reported in the install result.
 
-`link` runs the hook of every package you name, every time it runs. When nothing
-was newly linked and a hook is about to run (the "running it again" case), it
-prompts first; `--yes` skips. Hooks are expected to be idempotent.
+Which hooks `link` runs is decided from the remembered result of each hook's
+last run, for named packages and dependencies alike (see Persistent state). A
+hook runs when it has never run, failed last time, or its script changed since
+it last succeeded; a hook that last succeeded with the same script is skipped.
+`--force-hooks` runs every hook of the resolved set regardless. The `hook`
+command always runs the hooks it names. Because the decision no longer depends
+on file state, a hook-only package is skipped once it has succeeded, and there
+is no "run again?" prompt. Hooks are still expected to be idempotent, since
+`--force-hooks`, `hook`, and an edited script all run them again.
 
-A dependency you did not name is different: its hook is skipped when all of its
-files are already linked, because it did not change and you did not ask for it.
-A dependency that is partly linked, has a conflict, or has no files at all (a
-hook-only package, which can never be "already linked") still runs its hook.
-This is decided from file state alone; there is no record of whether a hook ever
-ran (see follow-up 2).
+## Persistent state
+
+One file per user remembers what puddlejump did, so a later run does not have
+to guess from the filesystem: `$XDG_STATE_HOME/puddlejump/state.toml` (default
+`~/.local/state/puddlejump/state.toml`; a relative `XDG_STATE_HOME` is ignored,
+as the XDG rules say). It is state, not config: written by puddlejump, never
+edited by hand, and safe to delete.
+
+```toml
+version = 1
+
+[[repo]]
+path = "/home/me/dotfiles"
+
+  [[repo.hook]]
+  package = "dwm"
+  status = "succeeded"       # succeeded | failed
+  exit_code = 0              # omitted when killed by a signal or not runnable
+  fingerprint = "af63dc4c8601ec8c"
+  ran_at = 1763380000        # seconds since the Unix epoch
+```
+
+- **Keyed by repo root**, so two repos never share records.
+- **A record, never an authority.** It decides only whether a hook runs. Nothing
+  on disk is changed on its say-so, and deleting the file loses history only:
+  every hook then counts as never run.
+- **Fingerprint.** FNV-1a (64-bit) of the hook script's bytes, as 16 hex digits.
+  It only has to notice an edit, and it is stable across Rust versions, which
+  `DefaultHasher` is not. A script that cannot be read counts as changed, so
+  running it reports the real problem.
+- **What is stored.** Only the result, never the output. A hook that could not
+  start is stored as failed with an empty fingerprint.
+- **When it is written.** After a real `link` or `hook` run, once, with the
+  results of the hooks that ran. `--dry-run`, `--no-hooks`, `status`, and an
+  install failure (which stops hooks before they start) write nothing, so a hook
+  that did not run is never remembered as having run.
+- **Atomic.** Written to a temporary file in the same directory, synced, and
+  renamed over the old one, so a crash leaves the old state or the new one.
+- **Damaged files are refused, not replaced.** A file that is unreadable, not
+  valid, has unknown keys, or has a different `version` refuses the command
+  (exit 2) before anything runs, so history is never silently discarded.
+- **A failed save is a warning.** The run already did its work, so an unwritable
+  state file prints a warning and leaves the exit status alone.
+
+The plan says why each hook runs (`never run`, `failed last time`, `script
+changed since it last succeeded`, `requested`), in the text plan and in the JSON
+plan's `reason`. `status` reports a hook that has never run, failed, or changed,
+and says nothing about one that is up to date.
 
 ## CLI
 
@@ -200,12 +250,12 @@ config's `repo`, else cwd),
 
 | Command | Behavior | Flags |
 |---|---|---|
-| `link [PACKAGE...]` | Resolve deps, link, install, run hooks. | `-n/--dry-run`, `--no-install`, `--no-hooks`, `-y/--yes` |
+| `link [PACKAGE...]` | Resolve deps, link, install, run the hooks that need running. | `-n/--dry-run`, `--no-install`, `--no-hooks`, `--force-hooks`, `-y/--yes` |
 | `unlink [PACKAGE...]` | Remove links pointing into the repo. Named packages only. Never uninstalls. | `-n`, `--prune` |
 | `relink [PACKAGE...]` | Unlink then link. **Filesystem only**: no installs, hooks, or dependency resolution. | `-n`, `--prune` |
-| `hook PACKAGE...` | Run the named packages' hooks in dependency order, after confirmation. | `-n`, `-y` |
+| `hook PACKAGE...` | Run the named packages' hooks in dependency order, after confirmation, whatever was remembered. | `-n`, `-y` |
 | `adopt PACKAGE PATH...` | Move real files into the package, then link them. | `-n` |
-| `status [PACKAGE...]` | Per-package state; missing system deps. | |
+| `status [PACKAGE...]` | Per-package state; missing system deps; hook state. | |
 | `list` | Packages and host profiles. | |
 | `init PATH` | Create a new repo at PATH. PATH is required; missing parents are created. `--repo` is ignored. | `-n` |
 
@@ -254,8 +304,8 @@ must list it, and a test fails until the starter documents it.
   stdout stays parseable.
 - **Prompts.** Only `y`/`yes` means yes; an empty answer or no terminal input
   means no, so a script cannot confirm by accident. Prompts: linking every
-  package (no packages named, no host profile), and running hooks again when
-  nothing was newly linked. `hook` always asks unless `--yes`.
+  package (no packages named, no host profile). `hook` always asks unless
+  `--yes`.
 - **Defaults when nothing is named.** `link` uses the host profile, else asks
   about every package. `status` uses the host profile, else every package.
   `unlink` and `relink` refuse rather than act on everything.
@@ -302,6 +352,8 @@ link.rs        FileSystemState: observe paths, writability
 apply.rs       apply file actions (re-checking each path)
 adopt.rs       adopt plan + apply
 hook.rs        run hooks with live output, collect outcomes
+hook_state.rs  fingerprints; decide which hooks need running; record outcomes
+state.rs       the persistent state file: load, atomic save, records
 execute.rs     run a whole plan: files, install, hooks; Report
 status.rs      Status per package
 ```
@@ -407,7 +459,17 @@ Every change ships with tests and must pass `cargo fmt --check`,
   dry-run changes nothing.
 - `status`: linked, unlinked, partial, broken, conflict, wrong-target; missing
   system deps; no backend reports unknown, not missing; files in the package
-  not yet linked.
+  not yet linked; hook never run, up to date, failed (with exit code), or
+  script changed.
+- `state`: round trip; missing file is empty state; corrupt, unknown-key,
+  versionless, and other-version files are errors that name the file; atomic
+  save leaves no temporary file and replaces the old state; unwritable
+  location is a typed error; repos are kept apart; records are sorted; XDG
+  path rules (unset, empty, relative).
+- `hook_state`: FNV-1a matches the reference vectors; editing changes the
+  fingerprint; a decision for each of never run, failed, changed, up to date,
+  and unreadable script; records for success, failure, signal, and
+  not-runnable; a hook that did not run keeps its record.
 
 **CLI integration tests** (`crates/puddlejump/tests/`, temp repo and target,
 fake `xbps-install`/`xbps-query`/`sudo` scripts first on `PATH`):
@@ -421,7 +483,15 @@ fake `xbps-install`/`xbps-query`/`sudo` scripts first on `PATH`):
 - Missing system deps reported with no backend while link succeeds; fake xbps
   gets one batched install of only the missing packages.
 - Failing hook: exit 1, links remain, later hooks still run; re-running `link`
-  prompts when nothing was newly linked, `--yes` skips.
+  retries it without asking.
+- Persistent state: a hook that succeeded is not re-run; a failed one is
+  retried; an edited script runs again; `--force-hooks` and `hook` always run;
+  `--dry-run`, `--no-hooks`, `status`, and an install failure write no state; a
+  dependency's hook is skipped once it succeeded (including a hook-only
+  package); `XDG_STATE_HOME` moves the file; a corrupt or newer-version file
+  refuses `link`, `hook`, and `status` (exit 2) without running or overwriting
+  anything; an unwritable state file warns and keeps the exit status; deleting
+  the file only loses history.
 - Root-required package as non-root: refuses up front, exit 2, nothing linked.
 - `link` with no arguments and no profile prompts; `--yes` skips; host
   profile selection; unknown host errors.
@@ -472,8 +542,10 @@ Adding a package manager means a new backend module plus one arm in
 
 1. Should `unlink` ever uninstall system packages? (needs tracking of what
    puddlejump installed)
-2. Persisted hook state (last run/result) so `link` can offer to retry failed
-   hooks without prompting heuristics.
+2. ~~Persisted hook state~~ Done in 0.2.0 (see Persistent state). Still open:
+   persisted *link* state, so puddlejump can tell the links it created from
+   others, notice links orphaned by a file removed from a package, and unlink a
+   package that no longer exists in the repo.
 3. Additional package managers (apt, pacman, dnf): one new implementation each.
 4. Optional `link_directories` escape hatch for directories that must be
    linked whole.

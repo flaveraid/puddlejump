@@ -7,9 +7,11 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::graph::DependencyGraph;
+use crate::hook_state::{fingerprint, reason_to_run, HookReason};
 use crate::link::FileSystemState;
-use crate::package::PackageName;
+use crate::package::{Package, PackageName};
 use crate::plan::{plan_link, Action, ConflictKind, PlanContext, PlanError, SkipReason};
+use crate::state::{HookRecord, HookStatus, RepoState};
 use crate::system::{plan_system, PackageManager, SystemNotice};
 
 /// The state of one file of a package in the target.
@@ -67,6 +69,22 @@ pub enum SystemStatus {
     Unknown,
 }
 
+/// What is known about a package's hook from its last run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HookSummary {
+    /// It last succeeded with the script as it is now.
+    UpToDate,
+    /// It has never run.
+    NeverRun,
+    /// It failed the last time it ran.
+    Failed {
+        /// The exit code, or `None` if it was killed or could not start.
+        exit_code: Option<i32>,
+    },
+    /// The script was edited since it last succeeded.
+    ScriptChanged,
+}
+
 /// The status of one package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PackageStatus {
@@ -78,31 +96,62 @@ pub struct PackageStatus {
     pub files: Vec<FileStatus>,
     /// Its declared system packages.
     pub system: SystemStatus,
+    /// Its hook, or `None` if it declares none.
+    pub hook: Option<HookSummary>,
+}
+
+/// What `record` and the script's current fingerprint say about a hook.
+fn summarize_hook(record: Option<&HookRecord>, current: Option<&str>) -> HookSummary {
+    match reason_to_run(record, current) {
+        None => HookSummary::UpToDate,
+        Some(HookReason::NeverRun) => HookSummary::NeverRun,
+        Some(HookReason::ScriptChanged) => HookSummary::ScriptChanged,
+        Some(HookReason::PreviouslyFailed) => HookSummary::Failed {
+            exit_code: record
+                .filter(|record| record.status == HookStatus::Failed)
+                .and_then(|record| record.exit_code),
+        },
+        // `reason_to_run` never answers `Forced`; that is the user's choice.
+        Some(HookReason::Forced) => HookSummary::NeverRun,
+    }
+}
+
+fn hook_status(package: &Package, remembered: &RepoState) -> Option<HookSummary> {
+    let script = package.dir.join(package.manifest.hook.as_ref()?);
+    let record = remembered
+        .hooks
+        .iter()
+        .find(|record| record.package == package.name);
+    let current = fingerprint(&script).ok();
+    Some(summarize_hook(record, current.as_deref()))
 }
 
 /// Reports the status of each named package, in the order given.
 ///
 /// Each package is looked at on its own, so one package's conflicts never
 /// change another's result. Relative package symlinks are reported as
-/// [`FileState::RelativeSymlink`].
+/// [`FileState::RelativeSymlink`]. `remembered` supplies each hook's last
+/// result.
 ///
 /// Errors if a package is unknown, its files cannot be listed, a path cannot
 /// be inspected, or the package manager cannot be queried.
 pub fn package_statuses(
     context: &PlanContext,
     packages: &[PackageName],
+    remembered: &RepoState,
     state: &dyn FileSystemState,
     manager: Option<&dyn PackageManager>,
 ) -> Result<Vec<PackageStatus>, PlanError> {
     packages
         .iter()
-        .map(|package| package_status(context, package, state, manager))
+        .map(|package| package_status(context, package, remembered, state, manager))
         .collect()
 }
 
 fn package_status(
     context: &PlanContext,
     package: &PackageName,
+    remembered: &RepoState,
     state: &dyn FileSystemState,
     manager: Option<&dyn PackageManager>,
 ) -> Result<PackageStatus, PlanError> {
@@ -117,11 +166,17 @@ fn package_status(
         .collect();
     files.sort_by(|a, b| a.link.cmp(&b.link));
     let system = system_status(context, &graph, manager)?;
+    let hook = context
+        .repo
+        .packages
+        .get(package)
+        .and_then(|declared| hook_status(declared, remembered));
     Ok(PackageStatus {
         package: package.clone(),
         state: summarize(&files),
         files,
         system,
+        hook,
     })
 }
 
@@ -284,7 +339,13 @@ mod tests {
             target_override: None,
         };
         let names: Vec<PackageName> = packages.iter().map(|p| name(p)).collect();
-        package_statuses(&context, &names, &RealFileSystem, manager)
+        package_statuses(
+            &context,
+            &names,
+            &RepoState::default(),
+            &RealFileSystem,
+            manager,
+        )
     }
 
     fn only(world: &World, package: &str) -> PackageStatus {
@@ -293,6 +354,118 @@ mod tests {
 
     fn states(status: &PackageStatus) -> Vec<&FileState> {
         status.files.iter().map(|file| &file.state).collect()
+    }
+
+    /// A world whose `dwm` package declares `setup.sh`, which exists on disk.
+    fn world_with_hook() -> World {
+        let mut world = world(&[("dwm", &[".dwmrc", "setup.sh"])]);
+        let manifest = Manifest {
+            hook: Some(PathBuf::from("setup.sh")),
+            ..Manifest::default()
+        };
+        with_manifest(&mut world, "dwm", manifest);
+        world
+    }
+
+    fn hook_summary_with(world: &World, records: Vec<HookRecord>) -> Option<HookSummary> {
+        let home = world.home();
+        let context = PlanContext {
+            repo: &world.repo,
+            home: &home,
+            target_override: None,
+        };
+        let remembered = RepoState {
+            hooks: records,
+            ..RepoState::default()
+        };
+        package_statuses(&context, &[name("dwm")], &remembered, &RealFileSystem, None)
+            .unwrap()
+            .remove(0)
+            .hook
+    }
+
+    fn hook_record(world: &World, status: HookStatus, exit_code: Option<i32>) -> HookRecord {
+        HookRecord {
+            package: name("dwm"),
+            status,
+            exit_code,
+            fingerprint: fingerprint(&world.source("dwm", "setup.sh")).unwrap(),
+            ran_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_package_without_a_hook_has_no_hook_status() {
+        let world = world(&[("zsh", &[".zshrc"])]);
+
+        assert_eq!(only(&world, "zsh").hook, None);
+    }
+
+    #[test]
+    fn a_hook_that_never_ran_says_so() {
+        let world = world_with_hook();
+
+        assert_eq!(
+            hook_summary_with(&world, vec![]),
+            Some(HookSummary::NeverRun)
+        );
+    }
+
+    #[test]
+    fn a_hook_that_succeeded_with_the_current_script_is_up_to_date() {
+        let world = world_with_hook();
+        let record = hook_record(&world, HookStatus::Succeeded, Some(0));
+
+        assert_eq!(
+            hook_summary_with(&world, vec![record]),
+            Some(HookSummary::UpToDate)
+        );
+    }
+
+    #[test]
+    fn a_hook_that_failed_reports_its_exit_code() {
+        let world = world_with_hook();
+        let record = hook_record(&world, HookStatus::Failed, Some(3));
+
+        assert_eq!(
+            hook_summary_with(&world, vec![record]),
+            Some(HookSummary::Failed { exit_code: Some(3) })
+        );
+    }
+
+    #[test]
+    fn a_hook_killed_by_a_signal_has_no_exit_code() {
+        let world = world_with_hook();
+        let record = hook_record(&world, HookStatus::Failed, None);
+
+        assert_eq!(
+            hook_summary_with(&world, vec![record]),
+            Some(HookSummary::Failed { exit_code: None })
+        );
+    }
+
+    #[test]
+    fn a_hook_edited_since_it_succeeded_is_reported_as_changed() {
+        let world = world_with_hook();
+        let record = hook_record(&world, HookStatus::Succeeded, Some(0));
+        fs::write(world.source("dwm", "setup.sh"), "echo edited").unwrap();
+
+        assert_eq!(
+            hook_summary_with(&world, vec![record]),
+            Some(HookSummary::ScriptChanged)
+        );
+    }
+
+    #[test]
+    fn a_record_for_another_package_is_ignored() {
+        let world = world_with_hook();
+        let mut record = hook_record(&world, HookStatus::Succeeded, Some(0));
+        record.package = name("other");
+
+        assert_eq!(
+            hook_summary_with(&world, vec![record]),
+            Some(HookSummary::NeverRun)
+        );
     }
 
     #[test]

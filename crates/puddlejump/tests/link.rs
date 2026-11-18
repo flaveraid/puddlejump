@@ -1,6 +1,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 use common::{link_target, Sandbox};
 use predicates::prelude::*;
@@ -640,61 +641,336 @@ fn a_dry_run_does_not_run_hooks() {
     assert!(!marker.exists());
 }
 
-#[test]
-fn running_link_again_asks_before_re_running_hooks_and_refuses_by_default() {
+/// A `dwm` package with a hook that appends a line to a log in the home
+/// directory, so a test can count how often it ran.
+fn dwm_with_logging_hook() -> (Sandbox, std::path::PathBuf) {
     let sandbox = Sandbox::new();
     sandbox.package_file("dwm", "config.h", "");
     sandbox.manifest("dwm", "hook = \"build.sh\"");
-    let marker = sandbox.home().join("hook-runs");
-    sandbox.package_script(
-        "dwm",
-        "build.sh",
-        &format!("echo run >> {}", marker.display()),
-    );
-    sandbox
-        .command()
-        .args(["link", "dwm", "--yes"])
-        .assert()
-        .success();
+    let log = sandbox.home().join("hook-runs");
+    sandbox.package_script("dwm", "build.sh", &format!("echo run >> {}", log.display()));
+    (sandbox, log)
+}
 
+fn link_dwm(sandbox: &Sandbox) -> assert_cmd::assert::Assert {
     sandbox
         .command()
         .args(["link", "dwm"])
         .write_stdin("")
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains(
-            "already linked, but these hooks would run again",
-        ));
-
-    assert_eq!(fs::read_to_string(&marker).unwrap(), "run\n");
 }
 
 #[test]
-fn running_link_again_re_runs_hooks_when_confirmed() {
+fn running_link_again_does_not_re_run_a_hook_that_already_succeeded() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    link_dwm(&sandbox).success();
+
+    link_dwm(&sandbox).success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\n");
+}
+
+#[test]
+fn running_link_again_never_asks_whether_to_re_run_hooks() {
+    let (sandbox, _log) = dwm_with_logging_hook();
+    link_dwm(&sandbox).success();
+
+    link_dwm(&sandbox)
+        .success()
+        .stderr(predicate::str::contains("Run them?").not());
+}
+
+#[test]
+fn force_hooks_re_runs_a_hook_that_already_succeeded() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    link_dwm(&sandbox).success();
+
+    sandbox
+        .command()
+        .args(["link", "dwm", "--force-hooks"])
+        .write_stdin("")
+        .assert()
+        .success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\nrun\n");
+}
+
+#[test]
+fn a_failed_hook_is_retried_on_the_next_link_without_asking() {
     let sandbox = Sandbox::new();
     sandbox.package_file("dwm", "config.h", "");
     sandbox.manifest("dwm", "hook = \"build.sh\"");
-    let marker = sandbox.home().join("hook-runs");
+    let log = sandbox.home().join("hook-runs");
+    let script = format!("echo run >> {}\nexit 3", log.display());
+    sandbox.package_script("dwm", "build.sh", &script);
+    link_dwm(&sandbox).code(1);
+
+    link_dwm(&sandbox).code(1);
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\nrun\n");
+}
+
+#[test]
+fn a_hook_that_was_fixed_runs_again_then_stops_being_retried() {
+    let sandbox = Sandbox::new();
+    sandbox.package_file("dwm", "config.h", "");
+    sandbox.manifest("dwm", "hook = \"build.sh\"");
+    let log = sandbox.home().join("hook-runs");
+    sandbox.package_script("dwm", "build.sh", "exit 3");
+    link_dwm(&sandbox).code(1);
     sandbox.package_script(
         "dwm",
         "build.sh",
-        &format!("echo run >> {}", marker.display()),
+        &format!("echo fixed >> {}", log.display()),
     );
+    link_dwm(&sandbox).success();
+
+    link_dwm(&sandbox).success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "fixed\n");
+}
+
+#[test]
+fn editing_a_hook_that_succeeded_makes_it_run_again() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    link_dwm(&sandbox).success();
+    sandbox.package_script(
+        "dwm",
+        "build.sh",
+        &format!("echo edited >> {}", log.display()),
+    );
+
+    link_dwm(&sandbox).success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\nedited\n");
+}
+
+#[test]
+fn the_hook_command_runs_even_when_the_hook_already_succeeded() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    link_dwm(&sandbox).success();
+
     sandbox
         .command()
-        .args(["link", "dwm", "--yes"])
+        .args(["hook", "dwm", "--yes"])
         .assert()
         .success();
 
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\nrun\n");
+}
+
+#[test]
+fn the_hook_command_records_its_result_so_link_does_not_repeat_it() {
+    let (sandbox, log) = dwm_with_logging_hook();
     sandbox
+        .command()
+        .args(["hook", "dwm", "--yes"])
+        .assert()
+        .success();
+
+    link_dwm(&sandbox).success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\n");
+}
+
+#[test]
+fn a_dry_run_does_not_remember_anything() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    sandbox
+        .command()
+        .args(["link", "dwm", "--dry-run"])
+        .assert()
+        .success();
+    assert!(!state_file(&sandbox).exists());
+
+    link_dwm(&sandbox).success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\n");
+}
+
+#[test]
+fn no_hooks_does_not_remember_a_hook_that_never_ran() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    sandbox
+        .command()
+        .args(["link", "dwm", "--no-hooks"])
+        .assert()
+        .success();
+
+    link_dwm(&sandbox).success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\n");
+}
+
+#[test]
+fn a_failed_install_does_not_remember_hooks_that_never_ran() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    sandbox.manifest("dwm", "hook = \"build.sh\"\n[packages]\nxbps = [\"gcc\"]");
+    sandbox.fake_tool("xbps-query", "exit 2");
+    sandbox.fake_tool("xbps-install", "exit 1");
+    sandbox.fake_sudo();
+    link_dwm(&sandbox).code(1);
+    assert!(!log.exists(), "the hook did not run");
+
+    sandbox.fake_tool("xbps-install", "true");
+    link_dwm(&sandbox).success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\n");
+}
+
+#[test]
+fn the_plan_says_why_each_hook_will_run() {
+    let (sandbox, _log) = dwm_with_logging_hook();
+
+    sandbox
+        .command()
+        .args(["link", "dwm", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hook: dwm"))
+        .stdout(predicate::str::contains("[never run]"));
+}
+
+#[test]
+fn a_dry_run_after_success_lists_no_hook() {
+    let (sandbox, _log) = dwm_with_logging_hook();
+    link_dwm(&sandbox).success();
+
+    sandbox
+        .command()
+        .args(["link", "dwm", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hook:").not());
+}
+
+#[test]
+fn the_json_plan_carries_the_hook_reason() {
+    let (sandbox, _log) = dwm_with_logging_hook();
+
+    let output = sandbox
+        .command()
+        .args(["--json", "link", "dwm", "--dry-run"])
+        .output()
+        .unwrap();
+
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["hooks"][0]["reason"], "NeverRun");
+}
+
+/// Where the state file lives in a sandbox that sets no `XDG_STATE_HOME`.
+fn state_file(sandbox: &Sandbox) -> std::path::PathBuf {
+    sandbox.home().join(".local/state/puddlejump/state.toml")
+}
+
+#[test]
+fn the_state_file_is_written_under_the_home_directory_by_default() {
+    let (sandbox, _log) = dwm_with_logging_hook();
+
+    link_dwm(&sandbox).success();
+
+    let text = fs::read_to_string(state_file(&sandbox)).unwrap();
+    assert!(text.contains("version = 1"), "{text}");
+    assert!(text.contains("package = \"dwm\""), "{text}");
+    assert!(text.contains("status = \"succeeded\""), "{text}");
+}
+
+#[test]
+fn xdg_state_home_moves_the_state_file() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    let xdg = sandbox.home().join("xdg-state");
+    fs::create_dir_all(&xdg).unwrap();
+    let link = |sandbox: &Sandbox| {
+        sandbox
+            .command()
+            .env("XDG_STATE_HOME", &xdg)
+            .args(["link", "dwm"])
+            .write_stdin("")
+            .assert()
+            .success();
+    };
+    link(&sandbox);
+
+    link(&sandbox);
+
+    assert!(xdg.join("puddlejump/state.toml").is_file());
+    assert!(!state_file(&sandbox).exists());
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\n");
+}
+
+#[test]
+fn a_corrupt_state_file_refuses_the_link_before_changing_anything() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    sandbox.home_file(".local/state/puddlejump/state.toml", "not [valid");
+
+    link_dwm(&sandbox)
+        .code(2)
+        .stderr(predicate::str::contains("invalid state file"));
+
+    assert!(!log.exists());
+    assert!(!sandbox.home().join("config.h").exists());
+}
+
+#[test]
+fn a_corrupt_state_file_refuses_the_hook_command_before_running() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    sandbox.home_file(".local/state/puddlejump/state.toml", "not [valid");
+
+    sandbox
+        .command()
+        .args(["hook", "dwm", "--yes"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid state file"));
+
+    assert!(!log.exists());
+}
+
+#[test]
+fn a_state_file_from_a_newer_version_is_refused_not_overwritten() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    let path = sandbox.home_file(".local/state/puddlejump/state.toml", "version = 99\n");
+
+    link_dwm(&sandbox)
+        .code(2)
+        .stderr(predicate::str::contains("format version 99"));
+
+    assert_eq!(fs::read_to_string(path).unwrap(), "version = 99\n");
+    assert!(!log.exists());
+}
+
+#[test]
+fn a_state_file_that_cannot_be_written_warns_but_does_not_fail_the_run() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    // A read-only state directory reads as empty but cannot be written to.
+    let directory = sandbox.home().join(".local/state/puddlejump");
+    fs::create_dir_all(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = sandbox
         .command()
         .args(["link", "dwm"])
-        .write_stdin("y\n")
-        .assert()
-        .success();
+        .write_stdin("")
+        .assert();
 
-    assert_eq!(fs::read_to_string(&marker).unwrap(), "run\nrun\n");
+    // Restore write access first so the temp directory can be cleaned up even
+    // if an assertion below fails.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    result
+        .success()
+        .stderr(predicate::str::contains("hook results were not remembered"));
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\n");
+}
+
+#[test]
+fn deleting_the_state_file_only_loses_history() {
+    let (sandbox, log) = dwm_with_logging_hook();
+    link_dwm(&sandbox).success();
+    fs::remove_file(state_file(&sandbox)).unwrap();
+
+    link_dwm(&sandbox).success();
+
+    assert_eq!(fs::read_to_string(&log).unwrap(), "run\nrun\n");
 }
 
 #[test]

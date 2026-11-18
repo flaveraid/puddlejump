@@ -67,8 +67,12 @@ pub struct LinkArgs {
     pub no_install: bool,
 
     /// Do not run hooks.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "force_hooks")]
     pub no_hooks: bool,
+
+    /// Run every hook even if it already succeeded with its current script.
+    #[arg(long)]
+    pub force_hooks: bool,
 
     /// Answer yes to confirmation questions.
     #[arg(short, long)]
@@ -175,6 +179,21 @@ mod tests {
 
         assert!(args.packages.is_empty());
         assert!(!args.dry_run && !args.no_install && !args.no_hooks && !args.yes);
+        assert!(!args.force_hooks);
+    }
+
+    #[test]
+    fn link_takes_force_hooks() {
+        let Command::Link(args) = parse(&["link", "--force-hooks"]).unwrap().command else {
+            panic!("expected link");
+        };
+
+        assert!(args.force_hooks);
+    }
+
+    #[test]
+    fn force_hooks_and_no_hooks_contradict_each_other() {
+        assert!(parse(&["link", "--force-hooks", "--no-hooks"]).is_err());
     }
 
     #[test]

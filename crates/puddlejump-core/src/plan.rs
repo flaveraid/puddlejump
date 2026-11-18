@@ -10,9 +10,11 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::graph::{DependencyGraph, GraphError, UnknownPackageError};
+use crate::hook_state::{fingerprint, reason_to_run, HookReason};
 use crate::link::{FileSystemState, FileSystemStateError, PathState};
 use crate::manifest::Target;
 use crate::package::{Package, PackageError, PackageName, Repo};
+use crate::state::RepoState;
 use crate::system::{plan_system, PackageManager, SystemError, SystemPlan};
 
 /// Directory under the repo root that holds the packages; needed to tell which
@@ -195,6 +197,8 @@ pub struct FilePlan {
 pub struct HookPlan {
     /// The package that declares the hook.
     pub package: PackageName,
+    /// Why it is going to run.
+    pub reason: HookReason,
     /// The hook script, inside the package directory.
     pub script: PathBuf,
     /// The package directory, which the hook runs in.
@@ -244,10 +248,10 @@ pub enum PlanError {
 /// Plans everything `link` does for the packages in `graph`: file actions,
 /// system package installs, and hooks, all in dependency order.
 ///
-/// `named` is what the user asked for. A hook runs for a named package, or for
-/// a dependency that has something to link in this run; a dependency that is
-/// not named and is already fully linked is left alone, so its hook does not
-/// run again.
+/// A hook runs when `remembered` says it needs to: it never ran, it failed
+/// last time, or its script changed since it last succeeded. A hook that last
+/// succeeded with the same script is left out, whether or not its package was
+/// named. With `force_hooks`, every hook of the graph runs regardless.
 ///
 /// Installing system packages adds [`RootReason::SystemInstall`].
 ///
@@ -256,7 +260,8 @@ pub enum PlanError {
 pub fn plan_full_link(
     context: &PlanContext,
     graph: &DependencyGraph,
-    named: &[PackageName],
+    remembered: &RepoState,
+    force_hooks: bool,
     state: &dyn FileSystemState,
     manager: Option<&dyn PackageManager>,
 ) -> Result<Plan, PlanError> {
@@ -266,7 +271,7 @@ pub fn plan_full_link(
     if !system.to_install.is_empty() {
         needs_root.push(RootReason::SystemInstall);
     }
-    let hooks = hooks_to_run(hooks_in_order(context, graph), named, &files.packages);
+    let hooks = hooks_to_run(hooks_in_order(context, graph), remembered, force_hooks);
     Ok(Plan {
         packages: files.packages,
         hooks,
@@ -278,56 +283,33 @@ pub fn plan_full_link(
 
 impl Plan {
     /// Whether applying this plan would create at least one link.
-    ///
-    /// False means everything is already linked, which is when `link` asks
-    /// before running hooks again.
     pub fn links_anything(&self) -> bool {
         self.packages.iter().any(links_something)
     }
-
-    /// Whether running this plan would re-run hooks on packages that are
-    /// already linked, which is when the user should be asked first.
-    ///
-    /// `hooks_enabled` is false when the user turned hooks off, in which case
-    /// no hook runs and there is nothing to ask about.
-    pub fn needs_hook_confirmation(&self, hooks_enabled: bool) -> bool {
-        hooks_enabled && !self.hooks.is_empty() && !self.links_anything()
-    }
 }
 
-/// Drops the hook of a package the user did not name when that package is
-/// already fully linked.
+/// Keeps the hooks that need to run, each with the reason, according to what
+/// was remembered about their last run.
 ///
-/// A package with no actions at all (it has a hook but no files) is not
-/// "already linked", since there is nothing to be linked, so its hook stays.
-fn hooks_to_run(
-    hooks: Vec<HookPlan>,
-    named: &[PackageName],
-    packages: &[PackageActions],
-) -> Vec<HookPlan> {
+/// With `force_hooks`, every hook is kept and its reason is
+/// [`HookReason::Forced`].
+fn hooks_to_run(hooks: Vec<HookPlan>, remembered: &RepoState, force_hooks: bool) -> Vec<HookPlan> {
     hooks
         .into_iter()
-        .filter(|hook| {
-            named.contains(&hook.package)
-                || !packages
+        .filter_map(|mut hook| {
+            hook.reason = if force_hooks {
+                HookReason::Forced
+            } else {
+                let record = remembered
+                    .hooks
                     .iter()
-                    .any(|package| package.package == hook.package && is_fully_linked(package))
+                    .find(|record| record.package == hook.package);
+                let current = fingerprint(&hook.script).ok();
+                reason_to_run(record, current.as_deref())?
+            };
+            Some(hook)
         })
         .collect()
-}
-
-/// Whether `package` has files and every one of them is already in place.
-fn is_fully_linked(package: &PackageActions) -> bool {
-    !package.actions.is_empty()
-        && package.actions.iter().all(|action| {
-            matches!(
-                action,
-                Action::Skip {
-                    reason: SkipReason::AlreadyLinked,
-                    ..
-                }
-            )
-        })
 }
 
 /// Whether applying `package` would create at least one link.
@@ -338,7 +320,9 @@ fn links_something(package: &PackageActions) -> bool {
         .any(|action| matches!(action, Action::Link { .. } | Action::LinkSymlinkCopy { .. }))
 }
 
-/// Plans running the hooks of exactly the named packages, in dependency order.
+/// Plans running the hooks of exactly the named packages, in dependency order,
+/// each with the reason [`HookReason::Forced`]: naming a hook explicitly is a
+/// request to run it, whatever was remembered.
 ///
 /// Dependencies that are not named are used only to order the named packages;
 /// their own hooks are not run. Packages without a hook are left out.
@@ -367,6 +351,7 @@ fn hooks_in_order(context: &PlanContext, graph: &DependencyGraph) -> Vec<HookPla
             let hook = package.manifest.hook.as_ref()?;
             Some(HookPlan {
                 package: name.clone(),
+                reason: HookReason::Forced,
                 script: package.dir.join(hook),
                 package_dir: package.dir.clone(),
                 target_dir: target_dir(context, package),
@@ -837,6 +822,7 @@ fn prune_actions(target_dir: &Path, actions: &[Action]) -> Vec<Action> {
 mod tests {
     use super::*;
     use crate::manifest::Manifest;
+    use crate::state::{HookRecord, HookStatus};
     use std::cell::RefCell;
     use std::collections::BTreeSet;
 
@@ -1848,7 +1834,8 @@ mod tests {
         plan_full_link(
             &context(repo, Path::new(HOME)),
             &graph,
-            &names(roots),
+            &RepoState::default(),
+            false,
             &FakeFileSystem::default(),
             manager,
         )
@@ -1881,6 +1868,7 @@ mod tests {
             plan.hooks,
             [HookPlan {
                 package: name("dwm"),
+                reason: HookReason::NeverRun,
                 script: source(&repo, "dwm", "build.sh"),
                 package_dir: repo.root.join("packages/dwm"),
                 target_dir: PathBuf::from(HOME),
@@ -1970,7 +1958,8 @@ mod tests {
         plan_full_link(
             &context(repo, Path::new(HOME)),
             graph,
-            &names(&["zsh"]),
+            &RepoState::default(),
+            false,
             filesystem,
             None,
         )
@@ -2055,55 +2044,6 @@ mod tests {
         assert!(!full_plan(&repo, &[], None).links_anything());
     }
 
-    /// A plan for a package with a hook, either not yet linked or already so.
-    fn plan_with_hook(already_linked: bool) -> Plan {
-        let (_root, repo) = repo_on_disk(&[package("dwm", &[".dwmrc"]).manifest(hooked(&[]))]);
-        let graph = DependencyGraph::build(&repo, &names(&["dwm"])).unwrap();
-        let mut filesystem = FakeFileSystem::default();
-        if already_linked {
-            filesystem = filesystem.symlink(
-                home_path(".dwmrc").to_str().unwrap(),
-                source(&repo, "dwm", ".dwmrc").to_str().unwrap(),
-            );
-        }
-        plan_full_link(
-            &context(&repo, Path::new(HOME)),
-            &graph,
-            &names(&["dwm"]),
-            &filesystem,
-            None,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn a_first_link_with_a_hook_needs_no_confirmation() {
-        assert!(!plan_with_hook(false).needs_hook_confirmation(true));
-    }
-
-    #[test]
-    fn an_already_linked_package_with_a_hook_needs_confirmation() {
-        assert!(plan_with_hook(true).needs_hook_confirmation(true));
-    }
-
-    #[test]
-    fn turned_off_hooks_never_need_confirmation() {
-        assert!(!plan_with_hook(true).needs_hook_confirmation(false));
-    }
-
-    #[test]
-    fn an_already_linked_package_without_a_hook_needs_no_confirmation() {
-        let (_root, repo) = repo_on_disk(&[package("zsh", &[".zshrc"])]);
-        let graph = DependencyGraph::build(&repo, &names(&["zsh"])).unwrap();
-        let filesystem = FakeFileSystem::default().symlink(
-            home_path(".zshrc").to_str().unwrap(),
-            source(&repo, "zsh", ".zshrc").to_str().unwrap(),
-        );
-        let plan = plan_zsh(&repo, &graph, &filesystem);
-
-        assert!(!plan.needs_hook_confirmation(true));
-    }
-
     #[test]
     fn hooks_of_named_packages_are_planned_in_dependency_order() {
         let (_root, repo) = repo_on_disk(&[
@@ -2140,96 +2080,206 @@ mod tests {
         assert_eq!(hook_packages(&hooks), ["dwm"]);
     }
 
-    /// A plan for `named` where `app` depends on `base`, both with hooks, and
-    /// `base` is already linked or not.
-    fn plan_with_dependency_hook(named: &[&str], base_already_linked: bool) -> Plan {
-        let (_root, repo) = repo_on_disk(&[
-            package("app", &[".apprc"]).manifest(hooked(&["base"])),
-            package("base", &[".baserc"]).manifest(hooked(&[])),
+    /// A repo where `app` depends on `base`, both with a real `setup.sh` on
+    /// disk so their fingerprints can be read.
+    fn hooked_app_and_base() -> (tempfile::TempDir, Repo) {
+        let (root, repo) = repo_on_disk(&[
+            package("app", &[".apprc", "setup.sh"]).manifest(hooked(&["base"])),
+            package("base", &[".baserc", "setup.sh"]).manifest(hooked(&[])),
         ]);
-        let graph = DependencyGraph::build(&repo, &names(named)).unwrap();
-        let mut filesystem = FakeFileSystem::default();
-        if base_already_linked {
-            filesystem = filesystem.symlink(
-                home_path(".baserc").to_str().unwrap(),
-                source(&repo, "base", ".baserc").to_str().unwrap(),
-            );
+        (root, repo)
+    }
+
+    /// What was remembered after `package`'s hook last ran with `status`, using
+    /// the script's real fingerprint unless `fingerprint_override` is given.
+    fn remembered_hook(
+        repo: &Repo,
+        package: &str,
+        status: HookStatus,
+        fingerprint_override: Option<&str>,
+    ) -> HookRecord {
+        let script = source(repo, package, "setup.sh");
+        HookRecord {
+            package: name(package),
+            status,
+            exit_code: None,
+            fingerprint: fingerprint_override
+                .map(str::to_string)
+                .unwrap_or_else(|| fingerprint(&script).unwrap()),
+            ran_at: 0,
         }
+    }
+
+    fn remembering(records: Vec<HookRecord>) -> RepoState {
+        RepoState {
+            hooks: records,
+            ..RepoState::default()
+        }
+    }
+
+    fn plan_remembering(repo: &Repo, named: &[&str], remembered: &RepoState, force: bool) -> Plan {
+        let graph = DependencyGraph::build(repo, &names(named)).unwrap();
         plan_full_link(
-            &context(&repo, Path::new(HOME)),
+            &context(repo, Path::new(HOME)),
             &graph,
-            &names(named),
-            &filesystem,
+            remembered,
+            force,
+            &FakeFileSystem::default(),
             None,
         )
         .unwrap()
     }
 
-    #[test]
-    fn the_hook_of_an_already_linked_dependency_is_not_planned() {
-        let plan = plan_with_dependency_hook(&["app"], true);
-
-        assert_eq!(hook_packages(&plan.hooks), ["app"]);
+    fn reasons(plan: &Plan) -> Vec<(&str, HookReason)> {
+        plan.hooks
+            .iter()
+            .map(|hook| (hook.package.as_str(), hook.reason))
+            .collect()
     }
 
     #[test]
-    fn the_hook_of_a_dependency_that_is_being_linked_is_planned() {
-        let plan = plan_with_dependency_hook(&["app"], false);
+    fn hooks_that_never_ran_are_planned_with_that_reason() {
+        let (_root, repo) = hooked_app_and_base();
 
-        assert_eq!(hook_packages(&plan.hooks), ["base", "app"]);
-    }
+        let plan = plan_remembering(&repo, &["app"], &RepoState::default(), false);
 
-    #[test]
-    fn the_hook_of_a_partly_linked_dependency_is_still_planned() {
-        let (_root, repo) = repo_on_disk(&[
-            package("app", &[".apprc"]).manifest(hooked(&["base"])),
-            package("base", &[".one", ".two"]).manifest(hooked(&[])),
-        ]);
-        let graph = DependencyGraph::build(&repo, &names(&["app"])).unwrap();
-        let filesystem = FakeFileSystem::default().symlink(
-            home_path(".one").to_str().unwrap(),
-            source(&repo, "base", ".one").to_str().unwrap(),
+        assert_eq!(
+            reasons(&plan),
+            [
+                ("base", HookReason::NeverRun),
+                ("app", HookReason::NeverRun)
+            ]
         );
-
-        let plan = plan_full_link(
-            &context(&repo, Path::new(HOME)),
-            &graph,
-            &names(&["app"]),
-            &filesystem,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(hook_packages(&plan.hooks), ["base", "app"]);
     }
 
     #[test]
-    fn the_hook_of_a_dependency_with_no_files_is_still_planned() {
-        // A hook-only package has nothing to link, so it can never be "already
-        // linked"; skipping it would mean its hook never runs as a dependency.
-        let (_root, repo) = repo_on_disk(&[
-            package("app", &[".apprc"]).manifest(hooked(&["setup"])),
-            package("setup", &[]).manifest(hooked(&[])),
+    fn a_hook_that_succeeded_with_the_same_script_is_left_out() {
+        let (_root, repo) = hooked_app_and_base();
+        let remembered = remembering(vec![remembered_hook(
+            &repo,
+            "base",
+            HookStatus::Succeeded,
+            None,
+        )]);
+
+        let plan = plan_remembering(&repo, &["app"], &remembered, false);
+
+        assert_eq!(reasons(&plan), [("app", HookReason::NeverRun)]);
+    }
+
+    #[test]
+    fn a_named_package_whose_hook_is_up_to_date_is_left_out_too() {
+        let (_root, repo) = hooked_app_and_base();
+        let remembered = remembering(vec![
+            remembered_hook(&repo, "base", HookStatus::Succeeded, None),
+            remembered_hook(&repo, "app", HookStatus::Succeeded, None),
         ]);
 
-        let plan = full_plan(&repo, &["app"], None);
+        let plan = plan_remembering(&repo, &["app", "base"], &remembered, false);
 
-        assert_eq!(hook_packages(&plan.hooks), ["setup", "app"]);
+        assert!(plan.hooks.is_empty());
     }
 
     #[test]
-    fn the_hook_of_a_named_package_is_planned_even_if_it_is_already_linked() {
-        let plan = plan_with_dependency_hook(&["app", "base"], true);
+    fn a_hook_that_failed_last_time_is_planned_for_retry() {
+        let (_root, repo) = hooked_app_and_base();
+        let remembered = remembering(vec![
+            remembered_hook(&repo, "base", HookStatus::Failed, None),
+            remembered_hook(&repo, "app", HookStatus::Succeeded, None),
+        ]);
 
-        assert_eq!(hook_packages(&plan.hooks), ["base", "app"]);
+        let plan = plan_remembering(&repo, &["app"], &remembered, false);
+
+        assert_eq!(reasons(&plan), [("base", HookReason::PreviouslyFailed)]);
     }
 
     #[test]
-    fn an_already_linked_dependency_does_not_force_hook_confirmation() {
-        // `app` is newly linked, so nothing here is a re-run worth asking about.
-        let plan = plan_with_dependency_hook(&["app"], true);
+    fn a_hook_whose_script_changed_is_planned_again() {
+        let (_root, repo) = hooked_app_and_base();
+        let remembered = remembering(vec![
+            remembered_hook(&repo, "base", HookStatus::Succeeded, Some("stale")),
+            remembered_hook(&repo, "app", HookStatus::Succeeded, None),
+        ]);
 
-        assert!(!plan.needs_hook_confirmation(true));
+        let plan = plan_remembering(&repo, &["app"], &remembered, false);
+
+        assert_eq!(reasons(&plan), [("base", HookReason::ScriptChanged)]);
+    }
+
+    #[test]
+    fn a_hook_only_dependency_that_succeeded_is_not_run_again() {
+        // Without memory a hook-only package could never be told apart from one
+        // that had not run, so it re-ran every time.
+        let (_root, repo) = repo_on_disk(&[
+            package("app", &[".apprc", "setup.sh"]).manifest(hooked(&["setup"])),
+            package("setup", &["setup.sh"]).manifest(hooked(&[])),
+        ]);
+        let remembered = remembering(vec![remembered_hook(
+            &repo,
+            "setup",
+            HookStatus::Succeeded,
+            None,
+        )]);
+
+        let plan = plan_remembering(&repo, &["app"], &remembered, false);
+
+        assert_eq!(reasons(&plan), [("app", HookReason::NeverRun)]);
+    }
+
+    #[test]
+    fn forcing_plans_every_hook_even_when_up_to_date() {
+        let (_root, repo) = hooked_app_and_base();
+        let remembered = remembering(vec![
+            remembered_hook(&repo, "base", HookStatus::Succeeded, None),
+            remembered_hook(&repo, "app", HookStatus::Succeeded, None),
+        ]);
+
+        let plan = plan_remembering(&repo, &["app"], &remembered, true);
+
+        assert_eq!(
+            reasons(&plan),
+            [("base", HookReason::Forced), ("app", HookReason::Forced)]
+        );
+    }
+
+    #[test]
+    fn a_hook_whose_script_is_missing_is_planned_so_the_problem_is_reported() {
+        let (_root, repo) = repo_on_disk(&[package("dwm", &[".dwmrc"]).manifest(hooked(&[]))]);
+        let remembered = remembering(vec![HookRecord {
+            package: name("dwm"),
+            status: HookStatus::Succeeded,
+            exit_code: Some(0),
+            fingerprint: "was-here-once".to_string(),
+            ran_at: 0,
+        }]);
+
+        let plan = plan_remembering(&repo, &["dwm"], &remembered, false);
+
+        assert_eq!(reasons(&plan), [("dwm", HookReason::ScriptChanged)]);
+    }
+
+    #[test]
+    fn what_is_remembered_about_another_package_does_not_apply() {
+        let (_root, repo) = hooked_app_and_base();
+        let remembered = remembering(vec![remembered_hook(
+            &repo,
+            "app",
+            HookStatus::Succeeded,
+            None,
+        )]);
+
+        let plan = plan_remembering(&repo, &["app"], &remembered, false);
+
+        assert_eq!(reasons(&plan), [("base", HookReason::NeverRun)]);
+    }
+
+    #[test]
+    fn explicitly_named_hooks_are_planned_as_forced() {
+        let (_root, repo) = hooked_app_and_base();
+
+        let hooks = hook_plan(&repo, &["app"]).unwrap();
+
+        assert_eq!(hooks[0].reason, HookReason::Forced);
     }
 
     #[test]
@@ -2301,7 +2351,8 @@ mod tests {
         let error = plan_full_link(
             &context(&repo, Path::new(HOME)),
             &graph,
-            &names(&["dwm"]),
+            &RepoState::default(),
+            false,
             &FakeFileSystem::default(),
             Some(&Failing),
         )

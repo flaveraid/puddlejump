@@ -40,6 +40,15 @@ pub fn xdg_config_home_from_environment() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The `XDG_STATE_HOME` directory, if set and not empty.
+///
+/// Whether it is usable (absolute) is decided by core, which owns the rule.
+pub fn xdg_state_home_from_environment() -> Option<PathBuf> {
+    env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The user `sudo` was run by, if set and not empty.
 pub fn sudo_user_from_environment() -> Option<String> {
     env::var("SUDO_USER").ok().filter(|value| !value.is_empty())

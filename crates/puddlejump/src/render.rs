@@ -10,8 +10,10 @@ use puddlejump_core::hook::{HookOutcome, HookResult};
 use puddlejump_core::host::HostName;
 use puddlejump_core::init::{InitConflict, InitNote, InitOutcome, InitPlan, InitResult, InitStep};
 use puddlejump_core::package::PackageName;
-use puddlejump_core::plan::{Action, ConflictKind, PackageActions, Plan, PlanWarning, RootReason};
-use puddlejump_core::status::{FileState, PackageState, PackageStatus, SystemStatus};
+use puddlejump_core::plan::{
+    Action, ConflictKind, HookPlan, PackageActions, Plan, PlanWarning, RootReason,
+};
+use puddlejump_core::status::{FileState, HookSummary, PackageState, PackageStatus, SystemStatus};
 use puddlejump_core::system::{ManagerId, SystemNotice, SystemPlan};
 
 /// Appends a formatted line. Writing to a `String` cannot fail.
@@ -131,13 +133,23 @@ fn system_section(out: &mut String, system: &SystemPlan) {
     }
 }
 
+/// Describes one planned hook in a line, including why it will run.
+pub fn hook_line(hook: &HookPlan) -> String {
+    format!(
+        "hook: {} ({}) [{}]",
+        hook.package,
+        hook.script.display(),
+        hook.reason
+    )
+}
+
 /// Renders everything `link` would do.
 pub fn plan(plan: &Plan) -> String {
     let mut out = String::new();
     file_actions(&mut out, &plan.packages);
     system_section(&mut out, &plan.system);
     for hook in &plan.hooks {
-        line!(out, "hook: {} ({})", hook.package, hook.script.display());
+        line!(out, "{}", hook_line(hook));
     }
     if !plan.needs_root.is_empty() {
         line!(out, "root required for:");
@@ -286,6 +298,22 @@ fn system_status(status: &SystemStatus) -> Option<String> {
     }
 }
 
+/// The hook line of a status, or `None` when there is nothing to say: no hook,
+/// or one that is up to date.
+fn hook_status(summary: Option<HookSummary>) -> Option<String> {
+    match summary? {
+        HookSummary::UpToDate => None,
+        HookSummary::NeverRun => Some("hook has never run".to_string()),
+        HookSummary::Failed {
+            exit_code: Some(code),
+        } => Some(format!("hook FAILED last time (exit status {code})")),
+        HookSummary::Failed { exit_code: None } => {
+            Some("hook FAILED last time (no exit status)".to_string())
+        }
+        HookSummary::ScriptChanged => Some("hook script changed since it last ran".to_string()),
+    }
+}
+
 /// Renders the status of each package. Files are listed only when they are not
 /// simply linked, so a healthy package is one line.
 pub fn statuses(statuses: &[PackageStatus]) -> String {
@@ -303,6 +331,9 @@ pub fn statuses(statuses: &[PackageStatus]) -> String {
             }
         }
         if let Some(text) = system_status(&status.system) {
+            line!(out, "  {text}");
+        }
+        if let Some(text) = hook_status(status.hook) {
             line!(out, "  {text}");
         }
     }
@@ -462,7 +493,8 @@ mod tests {
     use super::*;
     use puddlejump_core::apply::ActionOutcome;
     use puddlejump_core::hook::OutputLine;
-    use puddlejump_core::plan::{HookPlan, SkipReason};
+    use puddlejump_core::hook_state::HookReason;
+    use puddlejump_core::plan::SkipReason;
     use puddlejump_core::status::FileStatus;
     use std::path::PathBuf;
 
@@ -623,6 +655,7 @@ mod tests {
     fn hook(package: &str) -> HookPlan {
         HookPlan {
             package: name(package),
+            reason: HookReason::NeverRun,
             script: path("/r/build.sh"),
             package_dir: path("/r"),
             target_dir: path("/h"),
@@ -654,7 +687,7 @@ mod tests {
                 "dwm:",
                 "  link    /h/a -> /r/a",
                 "install (xbps): gcc make",
-                "hook: dwm (/r/build.sh)",
+                "hook: dwm (/r/build.sh) [never run]",
                 "root required for:",
                 "  - installing system packages",
                 "warning: package dwm needs root but its manifest does not say needs_root = true",
@@ -923,6 +956,7 @@ mod tests {
             state,
             files,
             system,
+            hook: None,
         }
     }
 
@@ -998,6 +1032,53 @@ mod tests {
                 "  /h/.zshrc  CONFLICT: a real file is in the way",
             ]
         );
+    }
+
+    fn status_with_hook(summary: HookSummary) -> PackageStatus {
+        PackageStatus {
+            hook: Some(summary),
+            ..status(
+                "dwm",
+                PackageState::Linked,
+                vec![file("/h/.dwmrc", FileState::Linked)],
+                SystemStatus::NothingDeclared,
+            )
+        }
+    }
+
+    #[test]
+    fn an_up_to_date_hook_adds_nothing_to_status() {
+        let statuses = [status_with_hook(HookSummary::UpToDate)];
+
+        assert_eq!(lines(&super::statuses(&statuses)), ["dwm: linked"]);
+    }
+
+    #[test]
+    fn status_says_what_is_wrong_with_a_hook() {
+        let cases = [
+            (HookSummary::NeverRun, "hook has never run"),
+            (
+                HookSummary::Failed { exit_code: Some(3) },
+                "hook FAILED last time (exit status 3)",
+            ),
+            (
+                HookSummary::Failed { exit_code: None },
+                "hook FAILED last time (no exit status)",
+            ),
+            (
+                HookSummary::ScriptChanged,
+                "hook script changed since it last ran",
+            ),
+        ];
+
+        for (summary, expected) in cases {
+            let statuses = [status_with_hook(summary)];
+
+            assert_eq!(
+                lines(&super::statuses(&statuses)),
+                ["dwm: linked".to_string(), format!("  {expected}")]
+            );
+        }
     }
 
     #[test]

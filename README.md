@@ -33,13 +33,23 @@ All fields are optional.
 target = "~"            # default "~"; or an absolute path like "/etc"
 needs_root = false      # true if linking needs root
 depends = ["zsh"]       # packages linked first
-hook = "build.sh"       # script run after linking
+hook = "build.sh"       # script run after linking, when it needs to run
 
 [packages]              # system packages, per package manager
 xbps = ["base-devel", "fd"]
 ```
 
 Only xbps (Void Linux) is supported. If no package manager is found, linking still works and the missing packages are reported.
+
+## Hooks
+
+puddlejump remembers how each hook last ran, so `link` runs a hook only when it needs to: it has never run, it failed last time, or its script changed since it last succeeded. A hook that already succeeded with the same script is skipped, and nothing asks you whether to run it again.
+
+- `link --force-hooks` runs every hook regardless.
+- `hook <packages...>` always runs the hooks you name.
+- `link -n` shows each hook and why it will run; `status` reports a hook that has never run, failed, or changed.
+
+This is kept in `~/.local/state/puddlejump/state.toml` (or `$XDG_STATE_HOME/puddlejump/state.toml`). It is safe to delete: every hook then counts as never run. A damaged state file stops the command before anything runs rather than being overwritten.
 
 ## Host profiles
 
@@ -79,7 +89,7 @@ puddlejump init <path>            # create a new dotfiles repo at <path>
 
 With no packages named, `link` uses the host profile, or asks before linking everything.
 
-Flags: `-n/--dry-run` (everything that changes files), `-y/--yes`, `--no-install`, `--no-hooks`, `--prune` (unlink, relink), `--target <dir>`, `--json`.
+Flags: `-n/--dry-run` (everything that changes files), `-y/--yes`, `--no-install`, `--no-hooks`, `--force-hooks`, `--prune` (unlink, relink), `--target <dir>`, `--json`.
 
 Run puddlejump as your own user, not with `sudo`; it refuses to run under `sudo` and uses `sudo` itself when a package needs root.
 

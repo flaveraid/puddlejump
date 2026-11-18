@@ -215,6 +215,118 @@ fn hook_with_json_prints_one_parseable_document() {
 }
 
 #[test]
+fn status_says_a_hook_has_never_run() {
+    let (sandbox, _log) = hooked_sandbox();
+
+    sandbox
+        .command()
+        .args(["status", "dwm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hook has never run"));
+}
+
+#[test]
+fn status_is_quiet_about_a_hook_that_succeeded() {
+    let (sandbox, _log) = hooked_sandbox();
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .success();
+
+    sandbox
+        .command()
+        .args(["status", "dwm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dwm: linked"))
+        .stdout(predicate::str::contains("hook").not());
+}
+
+#[test]
+fn status_reports_a_hook_that_failed_with_its_exit_code() {
+    let sandbox = Sandbox::new();
+    sandbox.package_file("dwm", "config.h", "");
+    sandbox.manifest("dwm", "hook = \"build.sh\"");
+    sandbox.package_script("dwm", "build.sh", "exit 5");
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .code(1);
+
+    sandbox
+        .command()
+        .args(["status", "dwm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "hook FAILED last time (exit status 5)",
+        ));
+}
+
+#[test]
+fn status_reports_a_hook_edited_since_it_succeeded() {
+    let (sandbox, log) = hooked_sandbox();
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .success();
+    sandbox.package_script("dwm", "build.sh", &format!("echo new >> {}", log.display()));
+
+    sandbox
+        .command()
+        .args(["status", "dwm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "hook script changed since it last ran",
+        ));
+}
+
+#[test]
+fn status_never_runs_a_hook_or_writes_state() {
+    let (sandbox, log) = hooked_sandbox();
+
+    sandbox.command().args(["status", "dwm"]).assert().success();
+
+    assert!(!log.exists());
+    assert!(!sandbox
+        .home()
+        .join(".local/state/puddlejump/state.toml")
+        .exists());
+}
+
+#[test]
+fn status_with_json_carries_the_hook_summary() {
+    let (sandbox, _log) = hooked_sandbox();
+
+    let output = sandbox
+        .command()
+        .args(["--json", "status", "dwm"])
+        .output()
+        .unwrap();
+
+    let statuses: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(statuses[0]["hook"], "NeverRun");
+}
+
+#[test]
+fn status_refuses_a_corrupt_state_file() {
+    let (sandbox, _log) = hooked_sandbox();
+    sandbox.home_file(".local/state/puddlejump/state.toml", "not [valid");
+
+    sandbox
+        .command()
+        .args(["status", "dwm"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid state file"));
+}
+
+#[test]
 fn status_reports_not_linked_then_linked() {
     let sandbox = Sandbox::new();
     sandbox.package_file("zsh", ".zshrc", "");

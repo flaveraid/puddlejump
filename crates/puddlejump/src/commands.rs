@@ -3,7 +3,8 @@
 
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use puddlejump_core::adopt::{plan_adopt, AdoptPlan};
@@ -12,7 +13,8 @@ use puddlejump_core::execute::{
     RefusalError, Verdict,
 };
 use puddlejump_core::graph::DependencyGraph;
-use puddlejump_core::hook::{run_hooks, HookObserver, HookOutputStream, HookResult};
+use puddlejump_core::hook::{run_hooks, HookObserver, HookOutcome, HookOutputStream, HookResult};
+use puddlejump_core::hook_state::remember_outcomes;
 use puddlejump_core::init::{execute_init, init_verdict, plan_init, InitError, InitPlan};
 use puddlejump_core::link::RealFileSystem;
 use puddlejump_core::package::PackageName;
@@ -21,6 +23,7 @@ use puddlejump_core::plan::{
     PackageActions, Plan,
 };
 use puddlejump_core::session::{PackageChoice, Session, SessionInputs};
+use puddlejump_core::state::{state_path, State};
 use puddlejump_core::status::package_statuses;
 use puddlejump_core::system::command::SystemCommandRunner;
 use puddlejump_core::system::privilege::Privilege;
@@ -146,6 +149,8 @@ pub struct Environment {
     pub host: Option<String>,
     /// The `XDG_CONFIG_HOME` value, which says where the user config is.
     pub xdg_config_home: Option<PathBuf>,
+    /// The `XDG_STATE_HOME` value, which says where the state file is.
+    pub xdg_state_home: Option<PathBuf>,
     /// The `SUDO_USER` value, set when run through `sudo`.
     pub sudo_user: Option<String>,
     /// The machine's hostname.
@@ -168,6 +173,7 @@ impl Environment {
             repo: environment::repo_from_environment(),
             host: environment::host_from_environment(),
             xdg_config_home: environment::xdg_config_home_from_environment(),
+            xdg_state_home: environment::xdg_state_home_from_environment(),
             sudo_user: environment::sudo_user_from_environment(),
             hostname: puddlejump_core::host::machine_hostname(),
             path: std::env::var_os("PATH"),
@@ -177,6 +183,10 @@ impl Environment {
 
     fn on_path(&self, program: &str) -> bool {
         environment::is_on_path(program, self.path.as_deref())
+    }
+
+    fn state_path(&self) -> PathBuf {
+        state_path(self.xdg_state_home.as_deref(), &self.home)
     }
 
     fn privilege(&self) -> Option<Privilege> {
@@ -201,7 +211,7 @@ pub fn run(cli: &Cli, environment: &Environment, terminal: &mut Terminal) -> Res
         Command::Link(args) => link(&session()?, args, environment, json, terminal),
         Command::Unlink(args) => unlink(&session()?, args, environment, json, terminal),
         Command::Relink(args) => relink(&session()?, args, environment, json, terminal),
-        Command::Hook(args) => hook(&session()?, args, json, terminal),
+        Command::Hook(args) => hook(&session()?, args, environment, json, terminal),
         Command::Adopt(args) => adopt(&session()?, args, environment, json, terminal),
     }
 }
@@ -269,9 +279,11 @@ fn status(
 ) -> Result<Outcome> {
     let choice = session.choose_packages(&args.packages, true)?;
     let manager = manager_for(session, environment)?;
+    let state = load_state(environment)?;
     let statuses = package_statuses(
         &session.plan_context(),
         choice.packages(),
+        &state.repo(&session.repo.root),
         &RealFileSystem,
         manager.as_deref(),
     )?;
@@ -341,6 +353,41 @@ impl HookObserver for LiveHookOutput<'_> {
     }
 }
 
+/// Reads what puddlejump remembers from earlier runs.
+///
+/// Errors if the state file exists but is unreadable or invalid. It is never
+/// replaced silently, so a damaged file cannot quietly lose history.
+fn load_state(environment: &Environment) -> Result<State> {
+    State::load(&environment.state_path()).map_err(Into::into)
+}
+
+/// Remembers the results of the hooks that just ran.
+///
+/// A run that already did its work is not failed by a state file that cannot
+/// be written, so this warns on stderr instead of returning an error.
+fn remember_hooks(
+    mut state: State,
+    session: &Session,
+    hooks: &[HookPlan],
+    outcomes: &[HookOutcome],
+    environment: &Environment,
+    terminal: &mut Terminal,
+) -> Result<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let mut repo = state.repo(&session.repo.root);
+    remember_outcomes(&mut repo, hooks, outcomes, SystemTime::now());
+    state.set_repo(repo);
+    let path: &Path = &environment.state_path();
+    if let Err(error) = state.save(path) {
+        terminal.warn(&format!(
+            "warning: hook results were not remembered: {error}"
+        ))?;
+    }
+    Ok(())
+}
+
 /// Everything `link` needs once the packages are chosen.
 struct LinkRun {
     plan: Plan,
@@ -370,6 +417,8 @@ fn choose_packages_to_link(
 fn plan_link_run(
     session: &Session,
     choice: &PackageChoice,
+    state: &State,
+    force_hooks: bool,
     environment: &Environment,
     terminal: &mut Terminal,
 ) -> Result<std::result::Result<LinkRun, Outcome>> {
@@ -381,7 +430,8 @@ fn plan_link_run(
     let plan = match plan_full_link(
         &session.plan_context(),
         &graph,
-        choice.packages(),
+        &state.repo(&session.repo.root),
+        force_hooks,
         &RealFileSystem,
         manager.as_deref(),
     ) {
@@ -405,7 +455,15 @@ fn link(
     let Some(choice) = choose_packages_to_link(session, args, terminal)? else {
         return Ok(Outcome::Refused);
     };
-    let run = match plan_link_run(session, &choice, environment, terminal)? {
+    let state = load_state(environment)?;
+    let run = match plan_link_run(
+        session,
+        &choice,
+        &state,
+        args.force_hooks,
+        environment,
+        terminal,
+    )? {
         Ok(run) => run,
         Err(outcome) => return Ok(outcome),
     };
@@ -419,10 +477,6 @@ fn link(
     }
     if !as_json {
         write!(terminal.err, "{}", render::plan_notes(&run.plan))?;
-    }
-    let confirmed = args.yes || !run.plan.needs_hook_confirmation(!args.no_hooks);
-    if !confirmed && !confirm_hooks_again(&run.plan.hooks, terminal)? {
-        return terminal.declined();
     }
     let options = ExecuteOptions {
         install: !args.no_install,
@@ -441,6 +495,14 @@ fn link(
         Ok(report) => report,
         Err(error) => return terminal.refuse_run(&error),
     };
+    remember_hooks(
+        state,
+        session,
+        &run.plan.hooks,
+        &report.hooks,
+        environment,
+        terminal,
+    )?;
     if as_json {
         terminal.show_json(&report)?;
     } else {
@@ -479,14 +541,6 @@ fn hook_names(hooks: &[HookPlan]) -> Vec<String> {
 
 fn confirm_hooks(hooks: &[HookPlan], terminal: &mut Terminal) -> Result<bool> {
     terminal.confirm_list("These hooks will run:", &hook_names(hooks), "Run them?")
-}
-
-fn confirm_hooks_again(hooks: &[HookPlan], terminal: &mut Terminal) -> Result<bool> {
-    terminal.confirm_list(
-        "Everything is already linked, but these hooks would run again:",
-        &hook_names(hooks),
-        "Run them?",
-    )
 }
 
 /// The packages `unlink` and `relink` act on. Never everything: these remove
@@ -611,6 +665,7 @@ fn show_file_outcomes(
 fn hook(
     session: &Session,
     args: &HookArgs,
+    environment: &Environment,
     as_json: bool,
     terminal: &mut Terminal,
 ) -> Result<Outcome> {
@@ -628,13 +683,15 @@ fn hook(
         terminal.warn("error: none of those packages has a hook")?;
         return Ok(Outcome::Refused);
     }
+    // Loaded before prompting or running, so a damaged state file refuses the
+    // request instead of failing after the hooks have already run.
+    let state = load_state(environment)?;
     if args.dry_run {
         if as_json {
             terminal.show_json(&hooks)?;
         } else {
             for hook in &hooks {
-                let line = format!("hook: {} ({})\n", hook.package, hook.script.display());
-                terminal.show(&line)?;
+                terminal.show(&format!("{}\n", render::hook_line(hook)))?;
             }
         }
         return Ok(Outcome::Success);
@@ -643,6 +700,7 @@ fn hook(
         return terminal.declined();
     }
     let outcomes = run_hooks(&hooks, &mut LiveHookOutput::new(terminal, as_json));
+    remember_hooks(state, session, &hooks, &outcomes, environment, terminal)?;
     if as_json {
         terminal.show_json(&outcomes)?;
     } else {

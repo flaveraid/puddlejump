@@ -284,6 +284,7 @@ mod tests {
         let script = write_script(&package_dir, "hook.sh", body, 0o755);
         let hook = HookPlan {
             package: PackageName::new(package).unwrap(),
+            reason: crate::hook_state::HookReason::NeverRun,
             script,
             package_dir,
             target_dir: root.path().join("home"),
