@@ -9,6 +9,7 @@ use puddlejump_core::execute::{InstallOutcome, Report};
 use puddlejump_core::hook::{HookOutcome, HookResult};
 use puddlejump_core::host::HostName;
 use puddlejump_core::init::{InitConflict, InitNote, InitOutcome, InitPlan, InitResult, InitStep};
+use puddlejump_core::link_state::StaleLink;
 use puddlejump_core::package::PackageName;
 use puddlejump_core::plan::{
     Action, ConflictKind, HookPlan, PackageActions, Plan, PlanWarning, RootReason,
@@ -298,25 +299,80 @@ fn system_status(status: &SystemStatus) -> Option<String> {
     }
 }
 
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+
+/// How long before `now` the time `then` was, such as `3 hours ago`, with both
+/// in seconds since the Unix epoch.
+///
+/// `None` when `then` is zero, which the state file uses for "not recorded".
+/// A time that is not in the past (clock skew) reads as `just now` rather than
+/// a negative age. Only the largest whole unit is shown, and days are the
+/// largest unit.
+fn ago(now: u64, then: u64) -> Option<String> {
+    if then == 0 {
+        return None;
+    }
+    let elapsed = now.saturating_sub(then);
+    let (count, unit) = if elapsed >= SECONDS_PER_DAY {
+        (elapsed / SECONDS_PER_DAY, "day")
+    } else if elapsed >= SECONDS_PER_HOUR {
+        (elapsed / SECONDS_PER_HOUR, "hour")
+    } else if elapsed >= SECONDS_PER_MINUTE {
+        (elapsed / SECONDS_PER_MINUTE, "minute")
+    } else {
+        return Some("just now".to_string());
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    Some(format!("{count} {unit}{plural} ago"))
+}
+
 /// The hook line of a status, or `None` when there is nothing to say: no hook,
-/// or one that is up to date.
-fn hook_status(summary: Option<HookSummary>) -> Option<String> {
+/// or one that is up to date. A hook that ran says when, if that is known.
+fn hook_status(summary: Option<HookSummary>, ran_at: Option<u64>, now: u64) -> Option<String> {
+    let when = ran_at.and_then(|ran_at| ago(now, ran_at));
+    let details = |first: Option<String>| -> String {
+        let parts: Vec<String> = first.into_iter().chain(when.clone()).collect();
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        }
+    };
     match summary? {
         HookSummary::UpToDate => None,
         HookSummary::NeverRun => Some("hook has never run".to_string()),
         HookSummary::Failed {
             exit_code: Some(code),
-        } => Some(format!("hook FAILED last time (exit status {code})")),
-        HookSummary::Failed { exit_code: None } => {
-            Some("hook FAILED last time (no exit status)".to_string())
-        }
-        HookSummary::ScriptChanged => Some("hook script changed since it last ran".to_string()),
+        } => Some(format!(
+            "hook FAILED last time{}",
+            details(Some(format!("exit status {code}")))
+        )),
+        HookSummary::Failed { exit_code: None } => Some(format!(
+            "hook FAILED last time{}",
+            details(Some("no exit status".to_string()))
+        )),
+        HookSummary::ScriptChanged => Some(format!(
+            "hook script changed since it last ran{}",
+            details(None)
+        )),
     }
 }
 
+/// " (linked 3 days ago)" for a link made at `linked_at`, or nothing when the
+/// time was not recorded.
+fn linked_ago(linked_at: u64, now: u64) -> String {
+    ago(now, linked_at)
+        .map(|when| format!(" (linked {when})"))
+        .unwrap_or_default()
+}
+
 /// Renders the status of each package. Files are listed only when they are not
-/// simply linked, so a healthy package is one line.
-pub fn statuses(statuses: &[PackageStatus]) -> String {
+/// simply linked, so a healthy package is one line. Times are shown relative to
+/// `now` (seconds since the Unix epoch), and only for things that need
+/// attention: a stale link, or a hook that failed or changed.
+pub fn statuses(statuses: &[PackageStatus], now: u64) -> String {
     let mut out = String::new();
     for status in statuses {
         line!(out, "{}: {}", status.package, package_state(status.state));
@@ -333,8 +389,41 @@ pub fn statuses(statuses: &[PackageStatus]) -> String {
         if let Some(text) = system_status(&status.system) {
             line!(out, "  {text}");
         }
-        if let Some(text) = hook_status(status.hook) {
+        for stale in &status.stale {
+            line!(
+                out,
+                "  {}  no longer provided by the package{}",
+                stale.link.display(),
+                linked_ago(stale.linked_at, now)
+            );
+        }
+        if let Some(text) = hook_status(status.hook, status.hook_ran_at, now) {
             line!(out, "  {text}");
+        }
+    }
+    out
+}
+
+/// Renders links puddlejump made for packages that are no longer in the repo,
+/// grouped by package, with how to remove them and how long ago each was made
+/// relative to `now` (seconds since the Unix epoch).
+pub fn stale_of_removed_packages(stale: &[StaleLink], now: u64) -> String {
+    let mut out = String::new();
+    let mut packages: Vec<&PackageName> = Vec::new();
+    for link in stale {
+        if !packages.contains(&&link.package) {
+            packages.push(&link.package);
+        }
+    }
+    for package in packages {
+        line!(out, "{package}: no longer in the repo");
+        for link in stale.iter().filter(|link| link.package == *package) {
+            line!(
+                out,
+                "  {}  still linked{}; `puddlejump unlink {package}` removes it",
+                link.link.display(),
+                linked_ago(link.linked_at, now)
+            );
         }
     }
     out
@@ -957,7 +1046,276 @@ mod tests {
             files,
             system,
             hook: None,
+            hook_ran_at: None,
+            stale: vec![],
         }
+    }
+
+    /// Renders as of `NOW`, for tests that do not care about the time.
+    fn render_statuses(statuses: &[PackageStatus]) -> String {
+        super::statuses(statuses, NOW)
+    }
+
+    fn stale_link(package: &str, link: &str) -> StaleLink {
+        StaleLink {
+            package: name(package),
+            link: path(link),
+            destination: path("/r/packages/gone"),
+            linked_at: 0,
+        }
+    }
+
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    /// A clock reading far enough from the epoch that subtracting a day or two
+    /// never lands on zero, which means "unknown".
+    const NOW: u64 = 1_000 * DAY;
+
+    fn stale_made(package: &str, link: &str, linked_at: u64) -> StaleLink {
+        StaleLink {
+            linked_at,
+            ..stale_link(package, link)
+        }
+    }
+
+    fn status_with_hook_ran(summary: HookSummary, ran_at: Option<u64>) -> PackageStatus {
+        PackageStatus {
+            hook: Some(summary),
+            hook_ran_at: ran_at,
+            ..status(
+                "dwm",
+                PackageState::Linked,
+                vec![file("/h/.dwmrc", FileState::Linked)],
+                SystemStatus::NothingDeclared,
+            )
+        }
+    }
+
+    #[test]
+    fn a_stale_link_says_how_long_ago_it_was_made() {
+        let statuses = [PackageStatus {
+            stale: vec![stale_made("zsh", "/h/.zshenv", NOW - 3 * DAY)],
+            ..status(
+                "zsh",
+                PackageState::Linked,
+                vec![file("/h/.zshrc", FileState::Linked)],
+                SystemStatus::NothingDeclared,
+            )
+        }];
+
+        assert_eq!(
+            lines(&render_statuses(&statuses)),
+            [
+                "zsh: linked",
+                "  /h/.zshenv  no longer provided by the package (linked 3 days ago)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_removed_packages_link_says_how_long_ago_it_was_made() {
+        let stale = [stale_made("vim", "/h/.vimrc", NOW - 2 * HOUR)];
+
+        assert_eq!(
+            lines(&super::stale_of_removed_packages(&stale, NOW)),
+            [
+                "vim: no longer in the repo",
+                "  /h/.vimrc  still linked (linked 2 hours ago); `puddlejump unlink vim` removes it",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_hook_says_its_exit_status_and_how_long_ago_it_ran() {
+        let statuses = [status_with_hook_ran(
+            HookSummary::Failed { exit_code: Some(3) },
+            Some(NOW - 2 * HOUR),
+        )];
+
+        assert_eq!(
+            lines(&render_statuses(&statuses)),
+            [
+                "dwm: linked",
+                "  hook FAILED last time (exit status 3, 2 hours ago)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hook_killed_by_a_signal_says_so_and_how_long_ago_it_ran() {
+        let statuses = [status_with_hook_ran(
+            HookSummary::Failed { exit_code: None },
+            Some(NOW - 5 * MINUTE),
+        )];
+
+        assert_eq!(
+            lines(&render_statuses(&statuses)),
+            [
+                "dwm: linked",
+                "  hook FAILED last time (no exit status, 5 minutes ago)"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edited_hook_says_how_long_ago_it_last_ran() {
+        let statuses = [status_with_hook_ran(
+            HookSummary::ScriptChanged,
+            Some(NOW - 5 * DAY),
+        )];
+
+        assert_eq!(
+            lines(&render_statuses(&statuses)),
+            [
+                "dwm: linked",
+                "  hook script changed since it last ran (5 days ago)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hook_that_never_ran_has_no_time_to_show() {
+        let statuses = [status_with_hook_ran(HookSummary::NeverRun, None)];
+
+        assert_eq!(
+            lines(&render_statuses(&statuses)),
+            ["dwm: linked", "  hook has never run"]
+        );
+    }
+
+    #[test]
+    fn a_hook_time_that_was_not_recorded_is_left_out() {
+        let statuses = [status_with_hook_ran(
+            HookSummary::Failed { exit_code: Some(3) },
+            Some(0),
+        )];
+
+        assert_eq!(
+            lines(&render_statuses(&statuses)),
+            ["dwm: linked", "  hook FAILED last time (exit status 3)"]
+        );
+    }
+
+    #[test]
+    fn an_up_to_date_hook_stays_quiet_even_though_its_time_is_known() {
+        let statuses = [status_with_hook_ran(HookSummary::UpToDate, Some(NOW - DAY))];
+
+        assert_eq!(lines(&render_statuses(&statuses)), ["dwm: linked"]);
+    }
+
+    #[test]
+    fn a_healthy_link_shows_no_time() {
+        let statuses = [PackageStatus {
+            hook_ran_at: Some(NOW - DAY),
+            ..status(
+                "zsh",
+                PackageState::Linked,
+                vec![file("/h/.zshrc", FileState::Linked)],
+                SystemStatus::NothingDeclared,
+            )
+        }];
+
+        assert_eq!(lines(&render_statuses(&statuses)), ["zsh: linked"]);
+    }
+
+    #[test]
+    fn a_time_of_zero_is_unknown_and_says_nothing() {
+        assert_eq!(super::ago(NOW, 0), None);
+    }
+
+    #[test]
+    fn under_a_minute_ago_is_just_now() {
+        assert_eq!(super::ago(NOW, NOW).as_deref(), Some("just now"));
+        assert_eq!(
+            super::ago(NOW, NOW - (MINUTE - 1)).as_deref(),
+            Some("just now")
+        );
+    }
+
+    #[test]
+    fn a_time_in_the_future_is_just_now_rather_than_negative() {
+        assert_eq!(super::ago(NOW, NOW + 5 * DAY).as_deref(), Some("just now"));
+    }
+
+    #[test]
+    fn minutes_are_counted_up_to_an_hour() {
+        let cases = [
+            (MINUTE, "1 minute ago"),
+            (2 * MINUTE, "2 minutes ago"),
+            (HOUR - 1, "59 minutes ago"),
+        ];
+        for (elapsed, expected) in cases {
+            assert_eq!(super::ago(NOW, NOW - elapsed).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn hours_are_counted_up_to_a_day() {
+        let cases = [
+            (HOUR, "1 hour ago"),
+            (3 * HOUR + 59 * MINUTE, "3 hours ago"),
+            (DAY - 1, "23 hours ago"),
+        ];
+        for (elapsed, expected) in cases {
+            assert_eq!(super::ago(NOW, NOW - elapsed).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn days_are_counted_without_rolling_up_into_longer_units() {
+        let cases = [
+            (DAY, "1 day ago"),
+            (2 * DAY + 23 * HOUR, "2 days ago"),
+            (45 * DAY, "45 days ago"),
+        ];
+        for (elapsed, expected) in cases {
+            assert_eq!(super::ago(NOW, NOW - elapsed).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn status_lists_the_links_a_package_made_but_no_longer_provides() {
+        let statuses = [PackageStatus {
+            stale: vec![stale_link("zsh", "/h/.zshenv")],
+            ..status(
+                "zsh",
+                PackageState::Linked,
+                vec![file("/h/.zshrc", FileState::Linked)],
+                SystemStatus::NothingDeclared,
+            )
+        }];
+
+        assert_eq!(
+            lines(&render_statuses(&statuses)),
+            [
+                "zsh: linked",
+                "  /h/.zshenv  no longer provided by the package"
+            ]
+        );
+    }
+
+    #[test]
+    fn orphans_of_a_package_that_is_gone_are_listed_under_their_package() {
+        let stale = [
+            stale_link("vim", "/h/.vimrc"),
+            stale_link("vim", "/h/.viminfo"),
+        ];
+
+        assert_eq!(
+            lines(&super::stale_of_removed_packages(&stale, NOW)),
+            [
+                "vim: no longer in the repo",
+                "  /h/.vimrc  still linked; `puddlejump unlink vim` removes it",
+                "  /h/.viminfo  still linked; `puddlejump unlink vim` removes it",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_orphans_of_removed_packages_renders_nothing() {
+        assert_eq!(super::stale_of_removed_packages(&[], NOW), "");
     }
 
     fn file(link: &str, state: FileState) -> FileStatus {
@@ -991,7 +1349,7 @@ mod tests {
             SystemStatus::NothingDeclared,
         )];
 
-        assert_eq!(lines(&super::statuses(&statuses)), ["zsh: linked"]);
+        assert_eq!(lines(&render_statuses(&statuses)), ["zsh: linked"]);
     }
 
     #[test]
@@ -1007,7 +1365,7 @@ mod tests {
         )];
 
         assert_eq!(
-            lines(&super::statuses(&statuses)),
+            lines(&render_statuses(&statuses)),
             ["zsh: partially linked", "  /h/.zshrc  not linked"]
         );
     }
@@ -1025,7 +1383,7 @@ mod tests {
         )];
 
         assert_eq!(
-            lines(&super::statuses(&statuses)),
+            lines(&render_statuses(&statuses)),
             [
                 "zsh: PROBLEM",
                 "  /h/.zshenv  linked",
@@ -1050,7 +1408,7 @@ mod tests {
     fn an_up_to_date_hook_adds_nothing_to_status() {
         let statuses = [status_with_hook(HookSummary::UpToDate)];
 
-        assert_eq!(lines(&super::statuses(&statuses)), ["dwm: linked"]);
+        assert_eq!(lines(&render_statuses(&statuses)), ["dwm: linked"]);
     }
 
     #[test]
@@ -1075,7 +1433,7 @@ mod tests {
             let statuses = [status_with_hook(summary)];
 
             assert_eq!(
-                lines(&super::statuses(&statuses)),
+                lines(&render_statuses(&statuses)),
                 ["dwm: linked".to_string(), format!("  {expected}")]
             );
         }
@@ -1090,7 +1448,7 @@ mod tests {
             SystemStatus::NothingDeclared,
         )];
 
-        assert!(super::statuses(&statuses).contains("relative symlink (cannot be copied)"));
+        assert!(render_statuses(&statuses).contains("relative symlink (cannot be copied)"));
     }
 
     #[test]
@@ -1122,7 +1480,7 @@ mod tests {
         )];
 
         assert_eq!(
-            lines(&super::statuses(&statuses)),
+            lines(&render_statuses(&statuses)),
             ["dwm: linked", "  missing system packages: gcc"]
         );
     }

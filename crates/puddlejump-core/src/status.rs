@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::graph::DependencyGraph;
 use crate::hook_state::{fingerprint, reason_to_run, HookReason};
 use crate::link::FileSystemState;
+use crate::link_state::{stale_links, StaleLink};
 use crate::package::{Package, PackageName};
 use crate::plan::{plan_link, Action, ConflictKind, PlanContext, PlanError, SkipReason};
 use crate::state::{HookRecord, HookStatus, RepoState};
@@ -98,6 +99,11 @@ pub struct PackageStatus {
     pub system: SystemStatus,
     /// Its hook, or `None` if it declares none.
     pub hook: Option<HookSummary>,
+    /// When its hook last ran, in seconds since the Unix epoch, or `None` if it
+    /// has never run. Kept apart from `hook` so that field's shape is unchanged.
+    pub hook_ran_at: Option<u64>,
+    /// Links puddlejump made for it that it no longer provides, still in place.
+    pub stale: Vec<StaleLink>,
 }
 
 /// What `record` and the script's current fingerprint say about a hook.
@@ -116,14 +122,21 @@ fn summarize_hook(record: Option<&HookRecord>, current: Option<&str>) -> HookSum
     }
 }
 
-fn hook_status(package: &Package, remembered: &RepoState) -> Option<HookSummary> {
-    let script = package.dir.join(package.manifest.hook.as_ref()?);
-    let record = remembered
+/// The remembered last run of `package`'s hook, if it has run.
+fn hook_record<'a>(package: &Package, remembered: &'a RepoState) -> Option<&'a HookRecord> {
+    remembered
         .hooks
         .iter()
-        .find(|record| record.package == package.name);
+        .find(|record| record.package == package.name)
+}
+
+fn hook_status(package: &Package, remembered: &RepoState) -> Option<HookSummary> {
+    let script = package.dir.join(package.manifest.hook.as_ref()?);
     let current = fingerprint(&script).ok();
-    Some(summarize_hook(record, current.as_deref()))
+    Some(summarize_hook(
+        hook_record(package, remembered),
+        current.as_deref(),
+    ))
 }
 
 /// Reports the status of each named package, in the order given.
@@ -131,7 +144,7 @@ fn hook_status(package: &Package, remembered: &RepoState) -> Option<HookSummary>
 /// Each package is looked at on its own, so one package's conflicts never
 /// change another's result. Relative package symlinks are reported as
 /// [`FileState::RelativeSymlink`]. `remembered` supplies each hook's last
-/// result.
+/// result, and which links were made for each package.
 ///
 /// Errors if a package is unknown, its files cannot be listed, a path cannot
 /// be inspected, or the package manager cannot be queried.
@@ -142,9 +155,10 @@ pub fn package_statuses(
     state: &dyn FileSystemState,
     manager: Option<&dyn PackageManager>,
 ) -> Result<Vec<PackageStatus>, PlanError> {
+    let stale = stale_links(context, remembered, state)?;
     packages
         .iter()
-        .map(|package| package_status(context, package, remembered, state, manager))
+        .map(|package| package_status(context, package, remembered, &stale, state, manager))
         .collect()
 }
 
@@ -152,6 +166,7 @@ fn package_status(
     context: &PlanContext,
     package: &PackageName,
     remembered: &RepoState,
+    stale: &[StaleLink],
     state: &dyn FileSystemState,
     manager: Option<&dyn PackageManager>,
 ) -> Result<PackageStatus, PlanError> {
@@ -166,17 +181,27 @@ fn package_status(
         .collect();
     files.sort_by(|a, b| a.link.cmp(&b.link));
     let system = system_status(context, &graph, manager)?;
-    let hook = context
-        .repo
-        .packages
-        .get(package)
-        .and_then(|declared| hook_status(declared, remembered));
+    let declared = context.repo.packages.get(package);
+    let hook = declared.and_then(|declared| hook_status(declared, remembered));
+    // Only a package that declares a hook has a hook time, even if the file
+    // still remembers an earlier hook it has since dropped.
+    let hook_ran_at = declared
+        .filter(|declared| declared.manifest.hook.is_some())
+        .and_then(|declared| hook_record(declared, remembered))
+        .map(|record| record.ran_at);
+    let stale = stale
+        .iter()
+        .filter(|link| link.package == *package)
+        .cloned()
+        .collect();
     Ok(PackageStatus {
         package: package.clone(),
         state: summarize(&files),
         files,
         system,
         hook,
+        hook_ran_at,
+        stale,
     })
 }
 
@@ -259,6 +284,7 @@ mod tests {
     use crate::link::RealFileSystem;
     use crate::manifest::Manifest;
     use crate::package::Repo;
+    use crate::state::LinkRecord;
     use crate::system::{ManagerId, SystemError};
     use std::collections::BTreeMap;
     use std::fs;
@@ -392,6 +418,146 @@ mod tests {
             fingerprint: fingerprint(&world.source("dwm", "setup.sh")).unwrap(),
             ran_at: 0,
         }
+    }
+
+    fn stale_with(world: &World, package: &str, records: Vec<LinkRecord>) -> Vec<StaleLink> {
+        let home = world.home();
+        let context = PlanContext {
+            repo: &world.repo,
+            home: &home,
+            target_override: None,
+        };
+        let remembered = RepoState {
+            links: records,
+            ..RepoState::default()
+        };
+        package_statuses(
+            &context,
+            &[name(package)],
+            &remembered,
+            &RealFileSystem,
+            None,
+        )
+        .unwrap()
+        .remove(0)
+        .stale
+    }
+
+    fn link_record(world: &World, package: &str, file: &str) -> LinkRecord {
+        LinkRecord {
+            package: name(package),
+            link: world.home().join(file),
+            destination: world.source(package, file),
+            linked_at: 700,
+        }
+    }
+
+    #[test]
+    fn a_stale_link_carries_the_time_it_was_made() {
+        let world = world(&[("zsh", &[".zshrc"])]);
+        let removed = link_record(&world, "zsh", ".zshenv");
+        symlink(&removed.destination, &removed.link).unwrap();
+
+        let stale = stale_with(&world, "zsh", vec![removed]);
+
+        assert_eq!(stale[0].linked_at, 700);
+    }
+
+    fn hook_ran_at_with(world: &World, records: Vec<HookRecord>) -> Option<u64> {
+        let home = world.home();
+        let context = PlanContext {
+            repo: &world.repo,
+            home: &home,
+            target_override: None,
+        };
+        let remembered = RepoState {
+            hooks: records,
+            ..RepoState::default()
+        };
+        package_statuses(&context, &[name("dwm")], &remembered, &RealFileSystem, None)
+            .unwrap()
+            .remove(0)
+            .hook_ran_at
+    }
+
+    #[test]
+    fn a_hook_that_ran_reports_when() {
+        let world = world_with_hook();
+        let mut record = hook_record(&world, HookStatus::Failed, Some(1));
+        record.ran_at = 9000;
+
+        assert_eq!(hook_ran_at_with(&world, vec![record]), Some(9000));
+    }
+
+    #[test]
+    fn a_hook_that_succeeded_still_reports_when_it_ran() {
+        let world = world_with_hook();
+        let mut record = hook_record(&world, HookStatus::Succeeded, Some(0));
+        record.ran_at = 9000;
+
+        assert_eq!(hook_ran_at_with(&world, vec![record]), Some(9000));
+    }
+
+    #[test]
+    fn a_hook_that_never_ran_has_no_time() {
+        let world = world_with_hook();
+
+        assert_eq!(hook_ran_at_with(&world, vec![]), None);
+    }
+
+    #[test]
+    fn another_packages_hook_time_is_not_reported() {
+        let world = world_with_hook();
+        let mut other = hook_record(&world, HookStatus::Succeeded, Some(0));
+        other.package = name("other");
+
+        assert_eq!(hook_ran_at_with(&world, vec![other]), None);
+    }
+
+    #[test]
+    fn a_package_without_a_hook_has_no_hook_time() {
+        let world = world(&[("zsh", &[".zshrc"])]);
+
+        assert_eq!(only(&world, "zsh").hook_ran_at, None);
+    }
+
+    #[test]
+    fn a_package_that_dropped_its_hook_does_not_report_the_old_hook_time() {
+        let world = world(&[("dwm", &[".dwmrc"])]);
+        let mut record = hook_record(&world_with_hook(), HookStatus::Succeeded, Some(0));
+        record.ran_at = 9000;
+
+        assert_eq!(hook_ran_at_with(&world, vec![record]), None);
+    }
+
+    #[test]
+    fn a_link_for_a_file_removed_from_the_package_is_reported_as_stale() {
+        let world = world(&[("zsh", &[".zshrc"])]);
+        let removed = link_record(&world, "zsh", ".zshenv");
+        symlink(&removed.destination, &removed.link).unwrap();
+
+        let stale = stale_with(&world, "zsh", vec![removed.clone()]);
+
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].link, removed.link);
+    }
+
+    #[test]
+    fn a_package_whose_links_are_all_wanted_has_nothing_stale() {
+        let world = world(&[("zsh", &[".zshrc"])]);
+        let wanted = link_record(&world, "zsh", ".zshrc");
+        symlink(&wanted.destination, &wanted.link).unwrap();
+
+        assert!(stale_with(&world, "zsh", vec![wanted]).is_empty());
+    }
+
+    #[test]
+    fn another_packages_stale_link_is_not_reported_for_this_package() {
+        let world = world(&[("zsh", &[".zshrc"]), ("vim", &[".vimrc"])]);
+        let removed = link_record(&world, "vim", ".vimswap");
+        symlink(&removed.destination, &removed.link).unwrap();
+
+        assert!(stale_with(&world, "zsh", vec![removed]).is_empty());
     }
 
     #[test]

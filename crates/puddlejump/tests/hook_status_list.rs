@@ -262,8 +262,114 @@ fn status_reports_a_hook_that_failed_with_its_exit_code() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "hook FAILED last time (exit status 5)",
+            "hook FAILED last time (exit status 5, ",
+        ))
+        .stdout(predicate::str::contains("just now)"));
+}
+
+/// Seconds in a day.
+const DAY: u64 = 24 * 60 * 60;
+
+/// Rewrites the remembered `ran_at` to `days_ago` days before now (plus an
+/// hour, so the run's own few seconds cannot tip it into the next unit down).
+fn age_hook_runs(sandbox: &Sandbox, days_ago: u64) {
+    let path = sandbox.home().join(".local/state/puddlejump/state.toml");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let then = now - days_ago * DAY - 60 * 60;
+    let aged: String = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("ran_at = ") {
+                format!("  ran_at = {then}\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    fs::write(path, aged).unwrap();
+}
+
+#[test]
+fn status_says_how_long_ago_a_failed_hook_ran() {
+    let sandbox = Sandbox::new();
+    sandbox.package_file("dwm", "config.h", "");
+    sandbox.manifest("dwm", "hook = \"build.sh\"");
+    sandbox.package_script("dwm", "build.sh", "exit 5");
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .code(1);
+    age_hook_runs(&sandbox, 2);
+
+    sandbox
+        .command()
+        .args(["status", "dwm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "hook FAILED last time (exit status 5, 2 days ago)",
         ));
+}
+
+#[test]
+fn status_says_how_long_ago_an_edited_hook_last_ran() {
+    let (sandbox, log) = hooked_sandbox();
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .success();
+    age_hook_runs(&sandbox, 5);
+    sandbox.package_script("dwm", "build.sh", &format!("echo new >> {}", log.display()));
+
+    sandbox
+        .command()
+        .args(["status", "dwm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "hook script changed since it last ran (5 days ago)",
+        ));
+}
+
+#[test]
+fn status_json_carries_when_a_hook_last_ran_in_seconds() {
+    let (sandbox, _log) = hooked_sandbox();
+    sandbox
+        .command()
+        .args(["link", "dwm", "--yes"])
+        .assert()
+        .success();
+
+    let output = sandbox
+        .command()
+        .args(["--json", "status", "dwm"])
+        .output()
+        .unwrap();
+
+    let statuses: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(statuses[0]["hook_ran_at"].as_u64().unwrap() > 0);
+    assert_eq!(statuses[0]["hook"], "UpToDate");
+}
+
+#[test]
+fn status_json_has_no_hook_time_for_a_hook_that_never_ran() {
+    let (sandbox, _log) = hooked_sandbox();
+
+    let output = sandbox
+        .command()
+        .args(["--json", "status", "dwm"])
+        .output()
+        .unwrap();
+
+    let statuses: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(statuses[0]["hook_ran_at"].is_null());
+    assert_eq!(statuses[0]["hook"], "NeverRun");
 }
 
 #[test]

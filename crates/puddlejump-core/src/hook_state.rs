@@ -4,13 +4,13 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde::Serialize;
 
 use crate::hook::{HookOutcome, HookResult};
 use crate::plan::HookPlan;
-use crate::state::{HookRecord, HookStatus, RepoState};
+use crate::state::{epoch_seconds, HookRecord, HookStatus, RepoState};
 
 /// FNV-1a's offset basis and prime for 64 bits. Chosen over `DefaultHasher`
 /// because that is not stable across Rust versions, and a fingerprint stored on
@@ -78,8 +78,7 @@ pub fn reason_to_run(record: Option<&HookRecord>, current: Option<&str>) -> Opti
 /// The record to remember for `outcome`, stamped with `now`.
 ///
 /// A script that cannot be read (a hook that was not runnable) is recorded
-/// with an empty fingerprint, which never matches a real one. A clock before
-/// the Unix epoch is recorded as time zero rather than failing the run.
+/// with an empty fingerprint, which never matches a real one.
 pub fn record_for(hook: &HookPlan, outcome: &HookOutcome, now: SystemTime) -> HookRecord {
     let exit_code = match &outcome.result {
         HookResult::Failed { exit_code } => *exit_code,
@@ -91,10 +90,7 @@ pub fn record_for(hook: &HookPlan, outcome: &HookOutcome, now: SystemTime) -> Ho
         status: HookStatus::from(&outcome.result),
         exit_code,
         fingerprint: fingerprint(&hook.script).unwrap_or_default(),
-        ran_at: now
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or_default(),
+        ran_at: epoch_seconds(now),
     }
 }
 
@@ -124,7 +120,7 @@ mod tests {
     use super::*;
     use crate::package::PackageName;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn record(status: HookStatus, fingerprint: &str) -> HookRecord {
         HookRecord {

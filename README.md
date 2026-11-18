@@ -47,9 +47,13 @@ puddlejump remembers how each hook last ran, so `link` runs a hook only when it 
 
 - `link --force-hooks` runs every hook regardless.
 - `hook <packages...>` always runs the hooks you name.
-- `link -n` shows each hook and why it will run; `status` reports a hook that has never run, failed, or changed.
+- `link -n` shows each hook and why it will run; `status` reports a hook that has never run, failed, or changed, and says how long ago it last ran.
 
 This is kept in `~/.local/state/puddlejump/state.toml` (or `$XDG_STATE_HOME/puddlejump/state.toml`). It is safe to delete: every hook then counts as never run. A damaged state file stops the command before anything runs rather than being overwritten.
+
+## Links that are no longer wanted
+
+The same file remembers the symlinks puddlejump created, and when. If you delete a file from a package, or delete the whole package, those links are left behind; `status` lists them with how long ago they were made, and `unlink <package>` removes them, even for a package that is no longer in the repo. Only links that still point where puddlejump left them are touched: a link you have since replaced or repointed is left alone. If you delete the state file, puddlejump forgets which links it made, so it can no longer clean up after a package that is gone from the repo.
 
 ## Host profiles
 

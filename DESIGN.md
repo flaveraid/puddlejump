@@ -1,6 +1,6 @@
 # puddlejump design
 
-The design of puddlejump (v1, plus the 0.2.0 persistent hook state described
+The design of puddlejump (v1, plus the persistent hook and link state described
 under Persistent state). `CLAUDE.md` holds the standing project rules
 (architecture, coding standards, testing); this file describes what puddlejump
 does and how it is built.
@@ -206,6 +206,12 @@ version = 1
 [[repo]]
 path = "/home/me/dotfiles"
 
+  [[repo.link]]
+  package = "zsh"
+  link = "/home/me/.zshrc"
+  destination = "/home/me/dotfiles/packages/zsh/.zshrc"
+  linked_at = 1763380000     # seconds since the Unix epoch; 0 when not recorded
+
   [[repo.hook]]
   package = "dwm"
   status = "succeeded"       # succeeded | failed
@@ -215,19 +221,22 @@ path = "/home/me/dotfiles"
 ```
 
 - **Keyed by repo root**, so two repos never share records.
-- **A record, never an authority.** It decides only whether a hook runs. Nothing
-  on disk is changed on its say-so, and deleting the file loses history only:
-  every hook then counts as never run.
+- **A record, never an authority.** A hook record decides only whether a hook
+  runs. A link record never removes anything by itself: it is checked against the
+  disk first (see Link records). Deleting the file loses history only: every hook
+  then counts as never run, and puddlejump forgets which links it made.
 - **Fingerprint.** FNV-1a (64-bit) of the hook script's bytes, as 16 hex digits.
   It only has to notice an edit, and it is stable across Rust versions, which
   `DefaultHasher` is not. A script that cannot be read counts as changed, so
   running it reports the real problem.
 - **What is stored.** Only the result, never the output. A hook that could not
   start is stored as failed with an empty fingerprint.
-- **When it is written.** After a real `link` or `hook` run, once, with the
-  results of the hooks that ran. `--dry-run`, `--no-hooks`, `status`, and an
-  install failure (which stops hooks before they start) write nothing, so a hook
-  that did not run is never remembered as having run.
+- **When it is written.** After a real `link`, `unlink`, `relink`, `adopt`, or
+  `hook` run, once, with the links it created or removed and the results of the
+  hooks that ran. A run that changed nothing worth remembering does not touch the
+  file. `--dry-run`, `--no-hooks`, `status`, and an install failure (which stops
+  hooks before they start) write nothing, so a hook that did not run is never
+  remembered as having run.
 - **Atomic.** Written to a temporary file in the same directory, synced, and
   renamed over the old one, so a crash leaves the old state or the new one.
 - **Damaged files are refused, not replaced.** A file that is unreadable, not
@@ -241,6 +250,63 @@ changed since it last succeeded`, `requested`), in the text plan and in the JSON
 plan's `reason`. `status` reports a hook that has never run, failed, or changed,
 and says nothing about one that is up to date.
 
+### Link records
+
+A link record says puddlejump created a symlink, so it can tell its own links
+from other people's and clean up after a package changes.
+
+- **Only links puddlejump created.** A link that `link` found already in place
+  is not recorded, because puddlejump did not make it. A link that failed or was
+  skipped does not exist, so it is not recorded either. `LinkSymlinkCopy` links
+  are recorded with the destination they were given.
+- **When it was made.** `linked_at` is stamped when the link is created, and a
+  link created again at the same path gets a fresh time. A record without one,
+  such as one written before it was kept, reads as `0`, which means "unknown"
+  and is never shown. The clock is clamped to `0` if it is before 1970, as
+  `ran_at` is, so a wrong clock cannot fail a run.
+- **Forgotten when removed.** A successful `unlink`, or one that found the link
+  already gone, drops the record. A removal that failed keeps it. `relink` is an
+  unlink followed by a link over the same outcomes, so its records end up current.
+- **Stale links.** A record is *stale* when the link is still on disk exactly as
+  recorded (a symlink to the recorded destination) but its package no longer
+  provides it: the package was deleted from the repo, or the file was removed
+  from the package. A link that is gone, was replaced by a real file, or now
+  points elsewhere is never stale, so puddlejump never claims what it did not
+  make. This is the one definition used by both `status` and `unlink`.
+- **`status`** lists a package's stale links under it (and as `stale` in the
+  JSON, an addition to each package's entry), and, in text, lists the stale links
+  of packages that are no longer in the repo under `<package>: no longer in the
+  repo`. Each stale link says how long ago it was made, such as `(linked 3 days
+  ago)`.
+
+### Times in `status`
+
+A time is shown only for something that needs attention, so a healthy `status`
+stays quiet: a stale link (`linked 3 days ago`), and a hook that failed (`exit
+status 3, 2 hours ago`) or whose script changed (`5 days ago`). A hook that has
+never run has no time, an up-to-date hook shows nothing, and a healthy link shows
+no time.
+
+Times are relative, in the largest whole unit: `just now` under a minute, then
+minutes, hours, and days (never weeks or months, so `45 days ago`). A time that
+is not in the past reads `just now`, and an unrecorded time (`0`) is left out.
+Core returns raw seconds since the epoch; only the CLI formats them, against a
+`now` it is handed so rendering stays deterministic. In JSON the raw seconds are
+kept: each stale link has `linked_at`, and each package has `hook_ran_at`
+(`null` when the hook has never run or the package has no hook). `hook_ran_at`
+is a separate field so the shape of `hook` is unchanged.
+- **`unlink`** removes a named package's stale links along with its current
+  ones, and accepts a package that is no longer in the repo if it has stale
+  links. Each removal re-checks the path when applied, like any other. A package
+  that is neither in the repo nor has stale links is still "does not exist".
+  Whether such a package needed root is unknown (it has no manifest), so it is
+  judged by whether the directory holding each link is writable. `--prune`
+  never prunes directories for a package that is no longer in the repo, since
+  its target directory is unknown; for the others, pruning is planned after all
+  removals so a directory is only pruned once the stale links in it are gone.
+- **Needs the state file.** With the file deleted, a package that is gone from
+  the repo cannot be unlinked by name, because nothing remembers its links.
+
 ## CLI
 
 Global flags: `--repo <dir>` (default `$PUDDLEJUMP_REPO`, else the user
@@ -251,11 +317,11 @@ config's `repo`, else cwd),
 | Command | Behavior | Flags |
 |---|---|---|
 | `link [PACKAGE...]` | Resolve deps, link, install, run the hooks that need running. | `-n/--dry-run`, `--no-install`, `--no-hooks`, `--force-hooks`, `-y/--yes` |
-| `unlink [PACKAGE...]` | Remove links pointing into the repo. Named packages only. Never uninstalls. | `-n`, `--prune` |
+| `unlink [PACKAGE...]` | Remove links pointing into the repo, and the stale links puddlejump made for the package. Named packages only; a package gone from the repo works if its links were remembered. Never uninstalls. | `-n`, `--prune` |
 | `relink [PACKAGE...]` | Unlink then link. **Filesystem only**: no installs, hooks, or dependency resolution. | `-n`, `--prune` |
 | `hook PACKAGE...` | Run the named packages' hooks in dependency order, after confirmation, whatever was remembered. | `-n`, `-y` |
 | `adopt PACKAGE PATH...` | Move real files into the package, then link them. | `-n` |
-| `status [PACKAGE...]` | Per-package state; missing system deps; hook state. | |
+| `status [PACKAGE...]` | Per-package state; missing system deps; hook state; stale links. | |
 | `list` | Packages and host profiles. | |
 | `init PATH` | Create a new repo at PATH. PATH is required; missing parents are created. `--repo` is ignored. | `-n` |
 
@@ -349,6 +415,7 @@ system/privileged_writer.rs file changes through sudo
 system/xbps.rs the only place that knows xbps commands
 plan.rs        Plan, Action: pure planning over FileSystemState
 link.rs        FileSystemState: observe paths, writability
+link_state.rs  remember and forget links; find stale links; plan unlinking them
 apply.rs       apply file actions (re-checking each path)
 adopt.rs       adopt plan + apply
 hook.rs        run hooks with live output, collect outcomes
@@ -489,9 +556,22 @@ fake `xbps-install`/`xbps-query`/`sudo` scripts first on `PATH`):
   `--dry-run`, `--no-hooks`, `status`, and an install failure write no state; a
   dependency's hook is skipped once it succeeded (including a hook-only
   package); `XDG_STATE_HOME` moves the file; a corrupt or newer-version file
-  refuses `link`, `hook`, and `status` (exit 2) without running or overwriting
-  anything; an unwritable state file warns and keeps the exit status; deleting
-  the file only loses history.
+  refuses `link`, `hook`, `status`, `unlink`, `relink`, and `adopt` (exit 2)
+  without running or overwriting anything; an unwritable state file warns and
+  keeps the exit status; deleting the file only loses history.
+- Link records: `link`, `relink`, and `adopt` remember the links they create (and
+  when) and not ones already in place; `unlink` forgets what it removes; `--dry-run` writes
+  nothing; `status` reports a link whose file left the package (text and JSON)
+  and the links of a package gone from the repo, and never claims a link the
+  user replaced; `unlink` removes stale links of a package that still exists and
+  of one that is gone, leaves a replaced link alone, and still errors for a
+  package that never existed; with the state file deleted a gone package cannot
+  be unlinked.
+- Times in `status`: a stale link and a failed or edited hook say how long ago
+  (aged by rewriting the state file, so the age is known without a clock); a
+  healthy link, an up-to-date hook, and a hook that never ran show none; a record
+  without a time shows none; JSON carries `linked_at` and `hook_ran_at` in
+  seconds.
 - Root-required package as non-root: refuses up front, exit 2, nothing linked.
 - `link` with no arguments and no profile prompts; `--yes` skips; host
   profile selection; unknown host errors.
@@ -542,10 +622,10 @@ Adding a package manager means a new backend module plus one arm in
 
 1. Should `unlink` ever uninstall system packages? (needs tracking of what
    puddlejump installed)
-2. ~~Persisted hook state~~ Done in 0.2.0 (see Persistent state). Still open:
-   persisted *link* state, so puddlejump can tell the links it created from
-   others, notice links orphaned by a file removed from a package, and unlink a
-   package that no longer exists in the repo.
+2. ~~Persisted hook state~~ and ~~persisted link state~~ Done (see Persistent
+   state): puddlejump tells the links it created from others, notices links
+   orphaned by a file removed from a package, and unlinks a package that no
+   longer exists in the repo.
 3. Additional package managers (apt, pacman, dnf): one new implementation each.
 4. Optional `link_directories` escape hatch for directories that must be
    linked whole.

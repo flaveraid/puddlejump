@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use puddlejump_core::adopt::{plan_adopt, AdoptPlan};
+use puddlejump_core::apply::PackageOutcome;
 use puddlejump_core::execute::{
     execute_adopt, execute_link, execute_relink, execute_unlink, file_verdict, ExecuteOptions,
     RefusalError, Verdict,
@@ -17,13 +18,17 @@ use puddlejump_core::hook::{run_hooks, HookObserver, HookOutcome, HookOutputStre
 use puddlejump_core::hook_state::remember_outcomes;
 use puddlejump_core::init::{execute_init, init_verdict, plan_init, InitError, InitPlan};
 use puddlejump_core::link::RealFileSystem;
+use puddlejump_core::link_state::{
+    forget_links, plan_unlink_with_stale, remember_links, root_reasons_for_stale, stale_links,
+    StaleLink,
+};
 use puddlejump_core::package::PackageName;
 use puddlejump_core::plan::{
-    plan_full_link, plan_hooks, plan_relink, plan_unlink, root_reasons_for, HookPlan,
-    PackageActions, Plan,
+    plan_full_link, plan_hooks, plan_relink, root_reasons_for, HookPlan, PackageActions, Plan,
+    PlanContext, PlanError, RootReason,
 };
 use puddlejump_core::session::{PackageChoice, Session, SessionInputs};
-use puddlejump_core::state::{state_path, State};
+use puddlejump_core::state::{epoch_seconds, state_path, RepoState, State};
 use puddlejump_core::status::package_statuses;
 use puddlejump_core::system::command::SystemCommandRunner;
 use puddlejump_core::system::privilege::Privilege;
@@ -280,19 +285,36 @@ fn status(
     let choice = session.choose_packages(&args.packages, true)?;
     let manager = manager_for(session, environment)?;
     let state = load_state(environment)?;
+    let remembered = state.repo(&session.repo.root);
     let statuses = package_statuses(
         &session.plan_context(),
         choice.packages(),
-        &state.repo(&session.repo.root),
+        &remembered,
         &RealFileSystem,
         manager.as_deref(),
     )?;
     if as_json {
         terminal.show_json(&statuses)?;
     } else {
-        terminal.show(&render::statuses(&statuses))?;
+        let now = epoch_seconds(SystemTime::now());
+        terminal.show(&render::statuses(&statuses, now))?;
+        let leftovers = stale_links_of_removed_packages(session, &remembered)?;
+        terminal.show(&render::stale_of_removed_packages(&leftovers, now))?;
     }
     Ok(Outcome::Success)
+}
+
+/// The stale links of packages that are no longer in the repo, which have no
+/// package status of their own to appear in.
+fn stale_links_of_removed_packages(
+    session: &Session,
+    remembered: &RepoState,
+) -> Result<Vec<StaleLink>> {
+    let stale = stale_links(&session.plan_context(), remembered, &RealFileSystem)?;
+    Ok(stale
+        .into_iter()
+        .filter(|link| !session.repo.packages.contains_key(&link.package))
+        .collect())
 }
 
 /// Where live hook output goes.
@@ -361,31 +383,70 @@ fn load_state(environment: &Environment) -> Result<State> {
     State::load(&environment.state_path()).map_err(Into::into)
 }
 
-/// Remembers the results of the hooks that just ran.
+/// Saves `state` after `update` has changed this repo's part of it.
 ///
 /// A run that already did its work is not failed by a state file that cannot
 /// be written, so this warns on stderr instead of returning an error.
-fn remember_hooks(
+fn save_state(
     mut state: State,
     session: &Session,
-    hooks: &[HookPlan],
-    outcomes: &[HookOutcome],
+    update: impl FnOnce(&mut RepoState),
+    remembered: &str,
     environment: &Environment,
     terminal: &mut Terminal,
 ) -> Result<()> {
-    if outcomes.is_empty() {
-        return Ok(());
-    }
     let mut repo = state.repo(&session.repo.root);
-    remember_outcomes(&mut repo, hooks, outcomes, SystemTime::now());
+    update(&mut repo);
     state.set_repo(repo);
     let path: &Path = &environment.state_path();
     if let Err(error) = state.save(path) {
         terminal.warn(&format!(
-            "warning: hook results were not remembered: {error}"
+            "warning: {remembered} were not remembered: {error}"
         ))?;
     }
     Ok(())
+}
+
+/// What a run did that is worth remembering: the links it changed and the
+/// hooks it ran.
+struct RunRecord<'a> {
+    /// The outcome of each file action, for link and unlink records.
+    files: &'a [PackageOutcome],
+    /// The hooks that were planned, to match against `hook_outcomes`.
+    hooks: &'a [HookPlan],
+    /// How each hook that ran turned out.
+    hook_outcomes: &'a [HookOutcome],
+}
+
+/// Remembers what `run` did, in one save.
+///
+/// Writes nothing when the run changed nothing worth remembering, so a run
+/// that found everything already in place never touches the state file.
+fn remember_run(
+    state: State,
+    session: &Session,
+    run: &RunRecord,
+    environment: &Environment,
+    terminal: &mut Terminal,
+) -> Result<()> {
+    let now = SystemTime::now();
+    let update = |repo: &mut RepoState| {
+        forget_links(repo, run.files);
+        remember_links(repo, run.files, now);
+        remember_outcomes(repo, run.hooks, run.hook_outcomes, now);
+    };
+    let before = state.repo(&session.repo.root);
+    let mut after = before.clone();
+    update(&mut after);
+    if after == before {
+        return Ok(());
+    }
+    let remembered = match (run.files.is_empty(), run.hook_outcomes.is_empty()) {
+        (_, true) => "links",
+        (true, false) => "hook results",
+        (false, false) => "links and hook results",
+    };
+    save_state(state, session, update, remembered, environment, terminal)
 }
 
 /// Everything `link` needs once the packages are chosen.
@@ -495,14 +556,12 @@ fn link(
         Ok(report) => report,
         Err(error) => return terminal.refuse_run(&error),
     };
-    remember_hooks(
-        state,
-        session,
-        &run.plan.hooks,
-        &report.hooks,
-        environment,
-        terminal,
-    )?;
+    let record = RunRecord {
+        files: &report.files,
+        hooks: &run.plan.hooks,
+        hook_outcomes: &report.hooks,
+    };
+    remember_run(state, session, &record, environment, terminal)?;
     if as_json {
         terminal.show_json(&report)?;
     } else {
@@ -570,15 +629,25 @@ fn unlink(
     let Some(packages) = packages_to_change(session, &args.packages, terminal)? else {
         return Ok(Outcome::Refused);
     };
+    // Loaded before anything changes, so a damaged state file refuses the
+    // request instead of failing after the links are already gone.
+    let state = load_state(environment)?;
+    let remembered = state.repo(&session.repo.root);
     let context = session.plan_context();
-    let plan = match plan_unlink(&context, &packages, args.prune, &RealFileSystem) {
+    let plan = match plan_unlink_with_stale(
+        &context,
+        &packages,
+        args.prune,
+        &remembered,
+        &RealFileSystem,
+    ) {
         Ok(plan) => plan,
         Err(error) => return terminal.refuse(error),
     };
     if args.dry_run {
         return show_file_plans(&plan, None, as_json, terminal);
     }
-    let reasons = match root_reasons_for(&context, &packages, &RealFileSystem) {
+    let reasons = match root_reasons_for_unlink(&context, &packages, &plan) {
         Ok(reasons) => reasons,
         Err(error) => return terminal.refuse(error),
     };
@@ -592,7 +661,46 @@ fn unlink(
         Ok(outcomes) => outcomes,
         Err(error) => return terminal.refuse_run(&error),
     };
+    remember_files(state, session, &outcomes, environment, terminal)?;
     show_file_outcomes(&outcomes, as_json, terminal)
+}
+
+/// Why unlinking `packages` needs root. Packages still in the repo say so
+/// through their manifest and target; for the rest, the only evidence is
+/// whether the directory holding each link can be written.
+fn root_reasons_for_unlink(
+    context: &PlanContext,
+    packages: &[PackageName],
+    plan: &[PackageActions],
+) -> Result<Vec<RootReason>, PlanError> {
+    let (in_repo, gone): (Vec<PackageName>, Vec<PackageName>) = packages
+        .iter()
+        .cloned()
+        .partition(|package| context.repo.packages.contains_key(package));
+    let mut reasons = root_reasons_for(context, &in_repo, &RealFileSystem)?;
+    let gone_plan: Vec<PackageActions> = plan
+        .iter()
+        .filter(|package| gone.contains(&package.package))
+        .cloned()
+        .collect();
+    reasons.extend(root_reasons_for_stale(&gone_plan, &RealFileSystem));
+    Ok(reasons)
+}
+
+/// Remembers the link changes in `outcomes`, with no hooks involved.
+fn remember_files(
+    state: State,
+    session: &Session,
+    outcomes: &[PackageOutcome],
+    environment: &Environment,
+    terminal: &mut Terminal,
+) -> Result<()> {
+    let record = RunRecord {
+        files: outcomes,
+        hooks: &[],
+        hook_outcomes: &[],
+    };
+    remember_run(state, session, &record, environment, terminal)
 }
 
 fn relink(
@@ -605,6 +713,7 @@ fn relink(
     let Some(packages) = packages_to_change(session, &args.packages, terminal)? else {
         return Ok(Outcome::Refused);
     };
+    let state = load_state(environment)?;
     let context = session.plan_context();
     let plan = match plan_relink(&context, &packages, args.prune, &RealFileSystem) {
         Ok(plan) => plan,
@@ -627,6 +736,7 @@ fn relink(
         Ok(outcomes) => outcomes,
         Err(error) => return terminal.refuse_run(&error),
     };
+    remember_files(state, session, &outcomes, environment, terminal)?;
     show_file_outcomes(&outcomes, as_json, terminal)
 }
 
@@ -700,7 +810,12 @@ fn hook(
         return terminal.declined();
     }
     let outcomes = run_hooks(&hooks, &mut LiveHookOutput::new(terminal, as_json));
-    remember_hooks(state, session, &hooks, &outcomes, environment, terminal)?;
+    let record = RunRecord {
+        files: &[],
+        hooks: &hooks,
+        hook_outcomes: &outcomes,
+    };
+    remember_run(state, session, &record, environment, terminal)?;
     if as_json {
         terminal.show_json(&outcomes)?;
     } else {
@@ -724,6 +839,7 @@ fn adopt(
     terminal: &mut Terminal,
 ) -> Result<Outcome> {
     let package = PackageName::new(&args.package).context("invalid package name")?;
+    let state = load_state(environment)?;
     let context = session.plan_context();
     let plan: AdoptPlan = match plan_adopt(&context, &package, &args.paths, &RealFileSystem) {
         Ok(plan) => plan,
@@ -752,6 +868,7 @@ fn adopt(
         Ok(report) => report,
         Err(error) => return terminal.refuse_run(&error),
     };
+    remember_files(state, session, &report.linked, environment, terminal)?;
     if as_json {
         terminal.show_json(&report)?;
     } else {

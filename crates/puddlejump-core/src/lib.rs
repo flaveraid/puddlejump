@@ -13,6 +13,7 @@ pub mod hook_state;
 pub mod host;
 pub mod init;
 pub mod link;
+pub mod link_state;
 pub mod manifest;
 pub mod package;
 pub mod plan;

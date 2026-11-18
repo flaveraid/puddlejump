@@ -10,6 +10,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -46,6 +47,20 @@ pub struct LinkRecord {
     pub link: PathBuf,
     /// What it pointed at when it was created.
     pub destination: PathBuf,
+    /// When it was created, in seconds since the Unix epoch. Zero when unknown,
+    /// as for a record written before this was kept.
+    #[serde(default)]
+    pub linked_at: u64,
+}
+
+/// `time` as seconds since the Unix epoch, as the state file stores it.
+///
+/// A clock before the epoch gives zero rather than an error: a wrong clock must
+/// not fail a run that already did its work.
+pub fn epoch_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 /// How a hook last turned out, reduced to what a later run needs to decide.
@@ -260,7 +275,51 @@ mod tests {
             package: name(package),
             link: PathBuf::from(link),
             destination: PathBuf::from("/repo/packages").join(package),
+            linked_at: 100,
         }
+    }
+
+    #[test]
+    fn epoch_seconds_counts_whole_seconds_since_the_epoch() {
+        let time = UNIX_EPOCH + std::time::Duration::from_millis(1500);
+
+        assert_eq!(epoch_seconds(time), 1);
+    }
+
+    #[test]
+    fn a_clock_before_the_epoch_is_zero_rather_than_an_error() {
+        let before = UNIX_EPOCH - std::time::Duration::from_secs(10);
+
+        assert_eq!(epoch_seconds(before), 0);
+    }
+
+    #[test]
+    fn a_link_record_written_without_a_time_loads_as_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.toml");
+        fs::write(
+            &path,
+            "version = 1\n\n[[repo]]\npath = \"/repo\"\n\n[[repo.link]]\n\
+             package = \"zsh\"\nlink = \"/h/.zshrc\"\ndestination = \"/r/.zshrc\"\n",
+        )
+        .unwrap();
+
+        let state = State::load(&path).unwrap();
+
+        assert_eq!(state.repo(Path::new("/repo")).links[0].linked_at, 0);
+    }
+
+    #[test]
+    fn the_time_a_link_was_made_is_saved_and_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.toml");
+        let mut state = State::default();
+        state.set_repo(repo_with(vec![link_record("zsh", "/h/.zshrc")], vec![]));
+
+        state.save(&path).unwrap();
+
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.repo(Path::new("/repo")).links[0].linked_at, 100);
     }
 
     fn hook_record(package: &str, status: HookStatus) -> HookRecord {

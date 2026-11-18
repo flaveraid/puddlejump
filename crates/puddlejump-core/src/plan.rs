@@ -797,7 +797,7 @@ fn unlink_action(
 
 /// Directories on the path of removed links, deepest first, never the target
 /// root itself.
-fn prune_actions(target_dir: &Path, actions: &[Action]) -> Vec<Action> {
+pub(crate) fn prune_actions(target_dir: &Path, actions: &[Action]) -> Vec<Action> {
     let mut directories = BTreeSet::new();
     for action in actions {
         if let Action::Unlink { link, .. } = action {
