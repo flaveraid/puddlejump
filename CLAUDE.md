@@ -16,6 +16,17 @@ shared library.
 - Never touch the user's filesystem in a surprising way. Every mutating
   operation must support a dry run and must refuse to overwrite real files
   unless explicitly told to.
+- **Compact, no bloat**, in code and in docs:
+  - Code: no comment that restates the code; no wrapper type, function, or
+    parameter used in only one place; no helper for a single call; no
+    intermediate variable that is read once on the next line; no near-duplicate
+    match arms or tests that one parameterized helper covers.
+  - Docs (`README.md`, `DESIGN.md`, `///`): say each fact once, in the one place
+    it belongs. A `///` is one line unless it states a behavior or error that
+    is not obvious from the signature. No history, no restating the code, no
+    filler. A README section is a few lines, not an essay.
+  - Touching a file means leaving it no longer than before, unless the task
+    adds behavior. Do not do repo-wide trimming unless asked.
 
 ## Workspace layout
 
