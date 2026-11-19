@@ -99,8 +99,7 @@ pub struct PackageStatus {
     pub system: SystemStatus,
     /// Its hook, or `None` if it declares none.
     pub hook: Option<HookSummary>,
-    /// When its hook last ran, in seconds since the Unix epoch, or `None` if it
-    /// has never run. Kept apart from `hook` so that field's shape is unchanged.
+    /// When its hook last ran (Unix seconds), or `None` if it never has.
     pub hook_ran_at: Option<u64>,
     /// Links puddlejump made for it that it no longer provides, still in place.
     pub stale: Vec<StaleLink>,
@@ -122,7 +121,6 @@ fn summarize_hook(record: Option<&HookRecord>, current: Option<&str>) -> HookSum
     }
 }
 
-/// The remembered last run of `package`'s hook, if it has run.
 fn hook_record<'a>(package: &Package, remembered: &'a RepoState) -> Option<&'a HookRecord> {
     remembered
         .hooks

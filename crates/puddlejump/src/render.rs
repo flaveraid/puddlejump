@@ -333,31 +333,21 @@ fn ago(now: u64, then: u64) -> Option<String> {
 /// or one that is up to date. A hook that ran says when, if that is known.
 fn hook_status(summary: Option<HookSummary>, ran_at: Option<u64>, now: u64) -> Option<String> {
     let when = ran_at.and_then(|ran_at| ago(now, ran_at));
-    let details = |first: Option<String>| -> String {
-        let parts: Vec<String> = first.into_iter().chain(when.clone()).collect();
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", parts.join(", "))
-        }
+    let (text, exit) = match summary? {
+        HookSummary::UpToDate => return None,
+        HookSummary::NeverRun => return Some("hook has never run".to_string()),
+        HookSummary::Failed { exit_code } => (
+            "hook FAILED last time",
+            Some(exit_code.map_or("no exit status".to_string(), |code| {
+                format!("exit status {code}")
+            })),
+        ),
+        HookSummary::ScriptChanged => ("hook script changed since it last ran", None),
     };
-    match summary? {
-        HookSummary::UpToDate => None,
-        HookSummary::NeverRun => Some("hook has never run".to_string()),
-        HookSummary::Failed {
-            exit_code: Some(code),
-        } => Some(format!(
-            "hook FAILED last time{}",
-            details(Some(format!("exit status {code}")))
-        )),
-        HookSummary::Failed { exit_code: None } => Some(format!(
-            "hook FAILED last time{}",
-            details(Some("no exit status".to_string()))
-        )),
-        HookSummary::ScriptChanged => Some(format!(
-            "hook script changed since it last ran{}",
-            details(None)
-        )),
+    let details: Vec<String> = exit.into_iter().chain(when).collect();
+    match details.is_empty() {
+        true => Some(text.to_string()),
+        false => Some(format!("{text} ({})", details.join(", "))),
     }
 }
 
