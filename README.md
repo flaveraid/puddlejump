@@ -86,7 +86,7 @@ puddlejump unlink [packages...]   # remove links
 puddlejump relink [packages...]   # unlink then link (files only)
 puddlejump adopt <package> <paths...>   # move existing files into a package and link them
 puddlejump hook <packages...>     # run hooks only
-puddlejump status [packages...]   # what is linked, missing, or in the way
+puddlejump status [packages...]   # repo, host, and env in use; what is linked, missing, or in the way
 puddlejump list                   # packages and host profiles
 puddlejump init <path>            # create a new dotfiles repo at <path>
 ```

@@ -600,6 +600,67 @@ fn status_with_no_packages_reports_every_package_when_there_is_no_host() {
 }
 
 #[test]
+fn status_shows_where_it_reads_from_and_a_summary() {
+    let sandbox = Sandbox::new();
+    sandbox.package_file("zsh", ".zshrc", "");
+    sandbox.package_file("nvim", ".nvimrc", "");
+    sandbox
+        .command()
+        .args(["link", "zsh", "--yes"])
+        .assert()
+        .success();
+
+    sandbox.repo_file("hosts/desk.toml", "packages = [\"zsh\", \"nvim\"]");
+    let home = sandbox.home();
+    sandbox
+        .command()
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("PUDDLEJUMP_HOST", "desk")
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "repo: {}",
+            sandbox.repo().display()
+        )))
+        .stdout(predicate::str::contains(format!(
+            "target: {}",
+            home.display()
+        )))
+        .stdout(predicate::str::contains(
+            "host: desk (from PUDDLEJUMP_HOST)",
+        ))
+        .stdout(predicate::str::contains("package manager: none"))
+        .stdout(predicate::str::contains(format!(
+            "state file: {}",
+            home.join("state/puddlejump/state.toml").display()
+        )))
+        .stdout(predicate::str::contains("PUDDLEJUMP_HOST=desk"))
+        .stdout(predicate::str::contains(format!(
+            "XDG_STATE_HOME={}",
+            home.join("state").display()
+        )))
+        .stdout(predicate::str::contains(
+            "2 packages: 1 linked, 1 not linked",
+        ));
+}
+
+#[test]
+fn status_json_stays_a_bare_array_without_the_context() {
+    let sandbox = Sandbox::new();
+    sandbox.package_file("zsh", ".zshrc", "");
+
+    let output = sandbox
+        .command()
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json.is_array());
+}
+
+#[test]
 fn status_with_a_host_reports_only_the_profile_packages() {
     let sandbox = Sandbox::new();
     sandbox.package_file("zsh", ".zshrc", "");

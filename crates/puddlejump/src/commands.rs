@@ -194,6 +194,23 @@ impl Environment {
         state_path(self.xdg_state_home.as_deref(), &self.home)
     }
 
+    /// The variables puddlejump honors that are set, with their values.
+    fn set_variables(&self) -> Vec<(&'static str, String)> {
+        let paths = [
+            ("PUDDLEJUMP_REPO", &self.repo),
+            ("XDG_CONFIG_HOME", &self.xdg_config_home),
+            ("XDG_STATE_HOME", &self.xdg_state_home),
+        ];
+        let mut set: Vec<_> = paths
+            .into_iter()
+            .filter_map(|(name, value)| Some((name, value.as_ref()?.display().to_string())))
+            .collect();
+        if let Some(host) = &self.host {
+            set.push(("PUDDLEJUMP_HOST", host.clone()));
+        }
+        set
+    }
+
     fn privilege(&self) -> Option<Privilege> {
         Privilege::resolve(self.is_root, self.on_path("sudo"))
     }
@@ -297,7 +314,20 @@ fn status(
         terminal.show_json(&statuses)?;
     } else {
         let now = epoch_seconds(SystemTime::now());
+        let context = render::context(
+            &session.repo.root,
+            session
+                .plan_context()
+                .target_override
+                .unwrap_or(&environment.home),
+            session.host.as_ref().map(|host| (&host.name, host.source)),
+            find_manager(session, environment)?,
+            &environment.state_path(),
+            &environment.set_variables(),
+        );
+        terminal.show(&context)?;
         terminal.show(&render::statuses(&statuses, now))?;
+        terminal.show(&render::status_summary(&statuses))?;
         let leftovers = stale_links_of_removed_packages(session, &remembered)?;
         terminal.show(&render::stale_of_removed_packages(&leftovers, now))?;
     }

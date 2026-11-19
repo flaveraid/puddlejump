@@ -321,7 +321,7 @@ config's `repo`, else cwd),
 | `relink [PACKAGE...]` | Unlink then link. **Filesystem only**: no installs, hooks, or dependency resolution. | `-n`, `--prune` |
 | `hook PACKAGE...` | Run the named packages' hooks in dependency order, after confirmation, whatever was remembered. | `-n`, `-y` |
 | `adopt PACKAGE PATH...` | Move real files into the package, then link them. | `-n` |
-| `status [PACKAGE...]` | Per-package state; missing system deps; hook state; stale links. | |
+| `status [PACKAGE...]` | Repo, target, host, package manager, state file, and set env vars; per-package state; missing system deps; hook state; stale links; a count by state. The context and count are text only; `--json` stays the package array. | |
 | `list` | Packages and host profiles. | |
 | `init PATH` | Create a new repo at PATH. PATH is required; missing parents are created. `--repo` is ignored. | `-n` |
 
@@ -546,7 +546,7 @@ fake `xbps-install`/`xbps-query`/`sudo` scripts first on `PATH`):
 - `unlink` removes only repo links; `--prune` removes empty directories only;
   `relink` picks up new files and never installs or runs hooks.
 - `adopt` moves and links; `--dry-run` doesn't.
-- `status` states and `--json` parses.
+- `status` states and `--json` parses; text shows the context and a count, JSON stays a bare array.
 - Missing system deps reported with no backend while link succeeds; fake xbps
   gets one batched install of only the missing packages.
 - Failing hook: exit 1, links remain, later hooks still run; re-running `link`
@@ -638,7 +638,7 @@ Adding a package manager means a new backend module plus one arm in
 10. Bundle `state`, `runner`, and `privilege` into one type if a second
     frontend ends up constructing the `execute_*` arguments.
 11. Add shell completions (fish, zsh)
-12. `status` with no opts/args should list all packages and whether they're 
-    linked; additionally list env variables and their values.
+12. ~~`status` context~~ Done: `status` lists the repo, target, host, manager,
+    state file, and set env vars, plus a count by state.
 13. Consider adding a `copy` option that copies package to target instead of link
 

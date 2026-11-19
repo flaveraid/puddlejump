@@ -2,12 +2,13 @@
 //! so they can be tested without a terminal.
 
 use std::fmt::Write;
+use std::path::Path;
 
 use puddlejump_core::adopt::{AdoptAction, AdoptOutcome, AdoptPlan, AdoptRefusal, AdoptResult};
 use puddlejump_core::apply::{ActionResult, PackageOutcome};
 use puddlejump_core::execute::{InstallOutcome, Report};
 use puddlejump_core::hook::{HookOutcome, HookResult};
-use puddlejump_core::host::HostName;
+use puddlejump_core::host::{HostName, HostSource};
 use puddlejump_core::init::{InitConflict, InitNote, InitOutcome, InitPlan, InitResult, InitStep};
 use puddlejump_core::link_state::StaleLink;
 use puddlejump_core::package::PackageName;
@@ -366,6 +367,67 @@ fn linked_ago(linked_at: u64, now: u64) -> String {
     ago(now, linked_at)
         .map(|when| format!(" (linked {when})"))
         .unwrap_or_default()
+}
+
+/// Renders a one-line count of `statuses` by state, such as
+/// `3 packages: 2 linked, 1 PROBLEM`, or nothing for no packages.
+pub fn status_summary(statuses: &[PackageStatus]) -> String {
+    let states = [
+        PackageState::Linked,
+        PackageState::Partial,
+        PackageState::NotLinked,
+        PackageState::Problem,
+        PackageState::Empty,
+    ];
+    let counts: Vec<String> = states
+        .into_iter()
+        .filter_map(|state| {
+            let count = statuses.iter().filter(|s| s.state == state).count();
+            (count > 0).then(|| format!("{count} {}", package_state(state)))
+        })
+        .collect();
+    match statuses.len() {
+        0 => String::new(),
+        1 => format!("1 package: {}\n", counts.join(", ")),
+        total => format!("{total} packages: {}\n", counts.join(", ")),
+    }
+}
+
+/// Renders where puddlejump is reading from: the repo, target, host (and how
+/// it was chosen), package manager, state file, and each `variables` entry.
+pub fn context(
+    repo: &Path,
+    target: &Path,
+    host: Option<(&HostName, HostSource)>,
+    manager: Option<ManagerId>,
+    state_file: &Path,
+    variables: &[(&str, String)],
+) -> String {
+    let mut out = String::new();
+    line!(out, "repo: {}", repo.display());
+    line!(out, "target: {}", target.display());
+    match host {
+        Some((name, source)) => line!(out, "host: {name} (from {})", host_source(source)),
+        None => line!(out, "host: none"),
+    }
+    match manager {
+        Some(manager) => line!(out, "package manager: {manager}"),
+        None => line!(out, "package manager: none"),
+    }
+    line!(out, "state file: {}", state_file.display());
+    for (variable, value) in variables {
+        line!(out, "{variable}={value}");
+    }
+    out
+}
+
+fn host_source(source: HostSource) -> &'static str {
+    match source {
+        HostSource::Flag => "--host",
+        HostSource::Environment => "PUDDLEJUMP_HOST",
+        HostSource::UserConfig => "the user config",
+        HostSource::Hostname => "the machine's hostname",
+    }
 }
 
 /// Renders the status of each package. Files are listed only when they are not
@@ -1402,6 +1464,80 @@ mod tests {
                 SystemStatus::NothingDeclared,
             )
         }
+    }
+
+    fn state_only(state: PackageState) -> PackageStatus {
+        status("p", state, vec![], SystemStatus::NothingDeclared)
+    }
+
+    #[test]
+    fn the_summary_counts_packages_by_state_and_skips_empty_counts() {
+        let statuses = [
+            state_only(PackageState::Linked),
+            state_only(PackageState::Linked),
+            state_only(PackageState::Partial),
+            state_only(PackageState::Problem),
+        ];
+
+        assert_eq!(
+            super::status_summary(&statuses),
+            "4 packages: 2 linked, 1 partially linked, 1 PROBLEM\n"
+        );
+    }
+
+    #[test]
+    fn the_summary_of_one_package_is_singular() {
+        let statuses = [state_only(PackageState::NotLinked)];
+
+        assert_eq!(
+            super::status_summary(&statuses),
+            "1 package: 1 not linked\n"
+        );
+    }
+
+    #[test]
+    fn the_summary_of_no_packages_is_empty() {
+        assert_eq!(super::status_summary(&[]), "");
+    }
+
+    #[test]
+    fn the_context_lists_where_everything_comes_from() {
+        let text = super::context(
+            &path("/r"),
+            &path("/h"),
+            Some((&HostName::new("desk").unwrap(), HostSource::Environment)),
+            Some(ManagerId::Xbps),
+            &path("/s/state.toml"),
+            &[("PUDDLEJUMP_HOST", "desk".to_string())],
+        );
+
+        assert_eq!(
+            lines(&text),
+            [
+                "repo: /r",
+                "target: /h",
+                "host: desk (from PUDDLEJUMP_HOST)",
+                "package manager: xbps",
+                "state file: /s/state.toml",
+                "PUDDLEJUMP_HOST=desk",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_context_says_none_for_a_missing_host_and_manager() {
+        let text = super::context(&path("/r"), &path("/h"), None, None, &path("/s"), &[]);
+
+        assert_eq!(
+            lines(&text),
+            [
+                "repo: /r",
+                "target: /h",
+                "host: none",
+                "package manager: none",
+                "state file: /s",
+            ]
+        );
     }
 
     #[test]
