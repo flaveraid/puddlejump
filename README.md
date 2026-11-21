@@ -39,21 +39,16 @@ hook = "build.sh"       # script run after linking, when it needs to run
 xbps = ["base-devel", "fd"]
 ```
 
-Only xbps (Void Linux) is supported. If no package manager is found, linking still works and the missing packages are reported.
+Only xbps (Void Linux) is supported at this time. If no package manager is found, linking still works and the missing packages are reported.
 
-## Hooks
+## State
 
-puddlejump remembers how each hook last ran, so `link` runs a hook only when it needs to: it has never run, it failed last time, or its script changed since it last succeeded. A hook that already succeeded with the same script is skipped, and nothing asks you whether to run it again.
+puddlejump records the links it made and how each hook last ran in `~/.local/state/puddlejump/state.toml` (or `$XDG_STATE_HOME/puddlejump/state.toml`).
 
-- `link --force-hooks` runs every hook regardless.
-- `hook <packages...>` always runs the hooks you name.
-- `link -n` shows each hook and why it will run; `status` reports a hook that has never run, failed, or changed, and says how long ago it last ran.
+- **Hooks:** `link` runs a hook only if it never ran, failed last time, or its script changed. `link --force-hooks` runs all; `hook <packages...>` runs the ones you name.
+- **Stale links:** links left behind by a deleted file or package show in `status`; `unlink <package>` removes them, even if the package is gone from the repo. Links you have since replaced or repointed are left alone.
 
-This is kept in `~/.local/state/puddlejump/state.toml` (or `$XDG_STATE_HOME/puddlejump/state.toml`). It is safe to delete: every hook then counts as never run. A damaged state file stops the command before anything runs rather than being overwritten.
-
-## Links that are no longer wanted
-
-The same file remembers the symlinks puddlejump created, and when. If you delete a file from a package, or delete the whole package, those links are left behind; `status` lists them with how long ago they were made, and `unlink <package>` removes them, even for a package that is no longer in the repo. Only links that still point where puddlejump left them are touched: a link you have since replaced or repointed is left alone. If you delete the state file, puddlejump forgets which links it made, so it can no longer clean up after a package that is gone from the repo.
+Deleting the state file is safe: every hook counts as never run, and stale links can no longer be cleaned up. A damaged state file stops the command before anything runs.
 
 ## Host profiles
 
